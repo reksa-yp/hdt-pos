@@ -1,0 +1,63 @@
+name: Deploy HDT POS
+
+# Jalan otomatis tiap kali ada push ke branch main:
+#  - job "deploy-edge-function": deploy Edge Function (backend) ke Supabase
+#  - job "deploy-pages": publish PWA (frontend) ke GitHub Pages
+#
+# Secrets yang WAJIB diisi dulu di GitHub:
+#   Settings -> Secrets and variables -> Actions -> New repository secret
+#   - SUPABASE_ACCESS_TOKEN   (dari https://supabase.com/dashboard/account/tokens)
+#   - SUPABASE_PROJECT_REF    (id project Supabase, contoh: abcdefghijklmnop)
+#
+# Catatan: SUPABASE_SERVICE_ROLE_KEY dan HMAC_SECRET TIDAK perlu (dan
+# TIDAK BOLEH) diisi di sini — itu di-set langsung di Supabase lewat
+# `supabase secrets set`, bukan lewat GitHub Actions, karena workflow ini
+# hanya men-deploy KODE Edge Function, bukan menjalankannya.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  deploy-edge-function:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Deploy Edge Function "api"
+        working-directory: supabase
+        run: supabase functions deploy api --project-ref "$SUPABASE_PROJECT_REF"
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+
+  deploy-pages:
+    runs-on: ubuntu-latest
+    needs: deploy-edge-function
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Siapkan folder publish
+        run: |
+          mkdir -p _site
+          cp -r hdtpos-pwa/. _site/
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
