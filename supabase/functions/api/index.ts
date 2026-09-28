@@ -19,11 +19,12 @@ const CORS = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS'
 };
 
-// Core.gs dibaca sekali saja lalu dipakai ulang (cold-start Deno saja yang
-// membaca file; request berikutnya di instance yang sama pakai cache ini).
+// Core.gs "dijalankan" sekali saja lalu dipakai ulang (cold-start Deno
+// saja yang men-decode dan mengeksekusinya; request berikutnya di
+// instance yang sama pakai cache ini).
 let corePromise = null;
 function getCore() {
-  if (!corePromise) corePromise = loadCore(import.meta.url);
+  if (!corePromise) corePromise = loadCore();
   return corePromise;
 }
 
