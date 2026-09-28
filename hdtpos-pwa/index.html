@@ -2274,17 +2274,17 @@ document.addEventListener('keydown', e => {
 
 function webAppUrlPrompt(onSaved) {
   const m = openModal({
-    title: 'Alamat Web App (Google Apps Script)', focus: '#wau',
-    body: '<p class="hint" style="margin:0 0 10px">Tempel URL "/exec" dari deployment Web App Apps Script Anda. Aplikasi ini akan memakainya untuk sinkronisasi data saat internet tersedia; tanpa internet, aplikasi tetap bisa dipakai memakai data terakhir yang tersimpan di perangkat.</p>' +
-      '<label class="field"><span>URL Web App</span><input id="wau" type="url" placeholder="https://script.google.com/macros/s/AKfycb.../exec" value="' + esc(getWebAppUrl()) + '"></label>' +
+    title: 'Alamat Server (Web App URL)', focus: '#wau',
+    body: '<p class="hint" style="margin:0 0 10px">Tempel URL Web App Apps Script ("/exec") ATAU URL Supabase Edge Function Anda. Aplikasi ini akan memakainya untuk sinkronisasi data saat internet tersedia; tanpa internet, aplikasi tetap bisa dipakai memakai data terakhir yang tersimpan di perangkat.</p>' +
+      '<label class="field"><span>URL Web App / Edge Function</span><input id="wau" type="url" placeholder="https://xxxx.supabase.co/functions/v1/api" value="' + esc(getWebAppUrl()) + '"></label>' +
       '<div class="form-error" id="waerr" hidden></div>',
     foot: '<button type="button" class="btn" data-close2>Batal</button><button type="button" class="btn btn-primary" id="wasave">Simpan</button>'
   });
   m.$('[data-close2]').onclick = () => m.close();
   const save = () => {
     const v = m.$('#wau').value.trim();
-    if (v && !/^https:\/\/script\.google(usercontent)?\.com\//.test(v)) {
-      const err = m.$('#waerr'); err.textContent = 'URL harus berupa alamat Web App Google Apps Script (diawali https://script.google.com/...).'; err.hidden = false; return;
+    if (v && !/^https:\/\//.test(v)) {
+      const err = m.$('#waerr'); err.textContent = 'URL harus diawali https://'; err.hidden = false; return;
     }
     setWebAppUrl(v); m.close(); updateSyncBadge(); toast('Alamat server disimpan.', 'ok');
     if (onSaved) { onSaved(v); }
@@ -3068,7 +3068,7 @@ function viewPengaturan() {
       '<label class="field"><span>Teks kaki struk</span><input id="sFoot" type="text" maxlength="250" value="' + esc(s.receipt_footer) + '"></label>' +
       '<label class="check" style="display:flex;margin-bottom:10px"><input type="checkbox" id="sLogoRc"' + (s.show_logo_on_receipt ? ' checked' : '') + '> Tampilkan logo di struk</label>' +
       '<label class="check" style="display:flex"><input type="checkbox" id="sAuto"' + (s.auto_print ? ' checked' : '') + '> Cetak struk otomatis setelah bayar (transaksi tanpa invoice)</label></div></div>' +
-    '<p class="page-note">Data usaha tersimpan di Google Sheets <b>“HDT POS Database”</b> pada Google Drive pemilik script, dan dicadangkan di perangkat ini supaya tetap bisa dipakai tanpa internet. Alamat server: <code>' + esc(getWebAppUrl() || '(belum diatur)') + '</code></p></div></div>';
+    '<p class="page-note">Data usaha tersimpan di server (Google Sheets atau Supabase, tergantung alamat server yang diatur), dan dicadangkan di perangkat ini supaya tetap bisa dipakai tanpa internet. Alamat server: <code>' + esc(getWebAppUrl() || '(belum diatur)') + '</code></p></div></div>';
   $('#sPaper').value = String(s.paper_width);
   drawLogo(); drawQris(); invPreview();
 }
