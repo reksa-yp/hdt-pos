@@ -4,6 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#2f5bea">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="HDT POS">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="icon" href="icons/icon-192.png">
 <title>HDT POS</title>
 <style>
 /* ===== HDT POS - tampilan ===== */
@@ -378,17 +386,1221 @@ body.is-kasir .side{ align-self:stretch; height:auto; }
   .toasts{ left:10px; right:10px; align-items:stretch; } .toast{ max-width:none; }
 }
 
+.sync-pill{ display:inline-flex; align-items:center; gap:6px; padding:5px 10px 5px 8px; border-radius:999px; font-size:12px; font-weight:600; cursor:pointer; border:1px solid transparent; user-select:none; white-space:nowrap; }
+.sync-pill .dot{ width:8px; height:8px; border-radius:50%; flex:none; }
+.sync-pill.is-online{ background:var(--ok-bg); color:var(--ok); } .sync-pill.is-online .dot{ background:var(--ok); }
+.sync-pill.is-offline{ background:var(--warn-bg); color:var(--warn); } .sync-pill.is-offline .dot{ background:var(--warn); }
+.sync-pill.is-pending{ background:var(--brand-soft); color:var(--brand); } .sync-pill.is-pending .dot{ background:var(--brand); animation:pulse 1.2s infinite; }
+.sync-pill.is-error{ background:var(--danger-bg); color:var(--danger); } .sync-pill.is-error .dot{ background:var(--danger); }
+@keyframes pulse{ 0%,100%{ opacity:1; } 50%{ opacity:.35; } }
+.setup-card{ max-width:420px; margin:14vh auto 0; padding:22px; background:var(--surface); border:1px solid var(--line); border-radius:14px; box-shadow:var(--shadow); }
+.setup-card h1{ margin:0 0 6px; font-size:20px; } .setup-card p{ margin:0 0 14px; color:var(--muted); font-size:14px; }
+
 </style>
 <style id="pageStyle"></style>
 </head>
 <body>
 <div id="bar"></div>
-<div id="demoNote" class="demo-note" hidden><span><b>Mode demo</b> — data disimpan di browser ini, belum terhubung ke Google Sheets.</span></div>
+<div id="setupGate" hidden></div>
 <div id="login" class="login" hidden></div>
 <div id="app" hidden></div>
 <div id="modals"></div>
 <div id="toasts" class="toasts" aria-live="polite"></div>
 <div id="printRoot"></div>
+
+<script>
+'use strict';
+/* =====================================================================
+   Core.gs (logika bisnis) ditempel APA ADANYA di bawah ini -- file yang
+   sama persis dipakai oleh server (Google Apps Script) & PWA offline ini,
+   supaya perilaku kasir/produk/pelanggan/user/service/laporan identik.
+   JANGAN edit bagian ini terpisah dari Core.gs di proyek Apps Script.
+   ===================================================================== */
+/**
+ * HDT POS - Core.gs
+ * Logika bisnis (login, kasir, produk, pelanggan, user, laporan).
+ * File ini TIDAK memanggil layanan Google secara langsung; semua akses data dan
+ * kripto lewat objek "platform" (lihat Code.gs). Karena itu file yang sama juga
+ * dipakai oleh demo di browser.
+ */
+
+var APP_VERSION = '1.0.0';
+var TZ_HOURS = 7;            // WIB (UTC+7)
+var SESSION_HOURS = 12;      // masa berlaku login
+var METHODS = ['cash', 'transfer', 'debit', 'credit', 'qris'];
+var ROLES = ['admin', 'kasir']; // admin = "Kasir Admin", kasir = "Kasir" biasa
+
+// Skema tabel. Tipe kolom: n = angka, s = teks, b = ya/tidak (disimpan 1/0)
+var SCHEMA = {
+  Users: [['id','n'],['username','s'],['salt','s'],['pass_hash','s'],['full_name','s'],['role','s'],['active','b'],['last_login','s'],['created_at','s']],
+  Categories: [['id','n'],['name','s']],
+  Products: [['id','n'],['type','s'],['category','s'],['sku','s'],['barcode','s'],['name','s'],['unit','s'],['cost_price','n'],['price','n'],['stock','n'],['min_stock','n'],['track_stock','b'],['created_at','s']],
+  Customers: [['id','n'],['name','s'],['phone','s'],['email','s'],['address','s'],['created_at','s']],
+  Transactions: [['id','n'],['invoice_no','s'],['date','s'],['user_id','n'],['user_name','s'],['customer_id','n'],['customer_name','s'],['customer_addr','s'],['subtotal','n'],['discount_type','s'],['discount_value','n'],['discount_amount','n'],['tax_rate','n'],['tax_amount','n'],['grand_total','n'],['method','s'],['amount_paid','n'],['change','n'],['status','s'],['note','s']],
+  TxItems: [['id','n'],['tx_id','n'],['invoice_no','s'],['date','s'],['user_id','n'],['product_id','n'],['name','s'],['type','s'],['qty','n'],['price','n'],['cost','n'],['subtotal','n']],
+  Evaluations: [['id','n'],['user_id','n'],['from','s'],['to','s'],['rating','n'],['bonus','n'],['note','s'],['updated_at','s'],['updated_by','s']],
+  StockLog: [['id','n'],['date','s'],['product_id','n'],['name','s'],['user_name','s'],['type','s'],['change','n'],['before','n'],['after','n'],['note','s']],
+  Settings: [['key','s'],['value','s']],
+  Services: [['id','n'],['service_no','s'],['date_in','s'],['date_out','s'],['customer_name','s'],['phone','s'],['item_name','s'],['item_color','s'],['completeness','s'],['problem','s'],['status','s'],['received_by','n'],['received_by_name','s'],['picked_up_at','s'],['note','s']]
+};
+
+var SETTING_DEFAULTS = {
+  store_name: 'HDT POS', store_address: '', store_phone: '', store_email: '', tax_no: '',
+  bank_name: '', bank_account: '', bank_holder: '',
+  tax_rate: '0', paper_width: '80', receipt_footer: 'Terima kasih atas kunjungan Anda.',
+  show_logo_on_receipt: '1', auto_print: '0', inv_code: '200', inv_year: '', inv_next: '1'
+};
+
+/* ---------------- util tanggal & angka ---------------- */
+function pad_(n, w) { var s = String(n); while (s.length < w) { s = '0' + s; } return s; }
+function wib_(d) {
+  var t = new Date(d.getTime() + TZ_HOURS * 3600000);
+  return { y: t.getUTCFullYear(), m: t.getUTCMonth() + 1, d: t.getUTCDate(), h: t.getUTCHours(), i: t.getUTCMinutes(), s: t.getUTCSeconds() };
+}
+function ymd_(p) { return p.y + '-' + pad_(p.m, 2) + '-' + pad_(p.d, 2); }
+function fmtDate_(d) { return ymd_(wib_(d)); }
+function fmtDateTime_(d) { var p = wib_(d); return ymd_(p) + ' ' + pad_(p.h, 2) + ':' + pad_(p.i, 2) + ':' + pad_(p.s, 2); }
+function isYmd_(s) { return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s); }
+function addDays_(s, n) {
+  var a = s.split('-');
+  var t = new Date(Date.UTC(+a[0], +a[1] - 1, +a[2] + n));
+  return t.getUTCFullYear() + '-' + pad_(t.getUTCMonth() + 1, 2) + '-' + pad_(t.getUTCDate(), 2);
+}
+function diffDays_(a, b) { // b - a (hari)
+  var x = a.split('-'), y = b.split('-');
+  return Math.round((Date.UTC(+y[0], +y[1] - 1, +y[2]) - Date.UTC(+x[0], +x[1] - 1, +x[2])) / 86400000);
+}
+function round0_(v) { return Math.round(v); }
+function round2_(v) { return Math.round(v * 100) / 100; }
+
+/* ================================================================ */
+function createBackend_(P) {
+  var db = P.db;
+
+  function fail(msg, code) { var e = new Error(msg); e.isApp = true; e.code = code || 'ERR'; throw e; }
+
+  /* ---------- validasi ---------- */
+  function str(v, max, label, required) {
+    var s = (v === null || v === undefined) ? '' : String(v).replace(/\r/g, '').replace(/[\u0000-\u0009\u000b-\u001f]/g, ' ').trim();
+    if (required && !s) { fail(label + ' wajib diisi.'); }
+    if (s.length > max) { fail(label + ' terlalu panjang (maksimal ' + max + ' karakter).'); }
+    return s;
+  }
+  function num(v, label, min, max) {
+    var n = Number(v);
+    if (v === '' || v === null || v === undefined || !isFinite(n)) { fail(label + ' harus berupa angka.'); }
+    if (n < min) { fail(label + ' tidak boleh kurang dari ' + min + '.'); }
+    if (n > max) { fail(label + ' terlalu besar.'); }
+    return n;
+  }
+  function int(v, label, min, max) {
+    var n = num(v, label, min, max);
+    if (Math.floor(n) !== n) { fail(label + ' harus bilangan bulat.'); }
+    return n;
+  }
+  function idList(v) {
+    if (!Array.isArray(v) || !v.length) { fail('Tidak ada data yang dipilih.'); }
+    if (v.length > 1000) { fail('Terlalu banyak data dipilih sekaligus (maksimal 1000).'); }
+    return v.map(function (x) { return refId(x, 'ID'); });
+  }
+  // ID rujukan ke baris lain (mis. product_id, customer_id, atau id baris yang diedit/dihapus).
+  // Server SELALU memberi id positif, tapi mesin offline (PWA) sementara memberi id NEGATIF
+  // untuk baris yang baru dibuat di perangkat & belum tersinkron -- supaya kasir/produk/dst
+  // tetap bisa dipakai (dan saling berelasi) sepenuhnya offline sebelum ada koneksi internet.
+  // Karena itu rentang di sini sengaja mencakup negatif; server sendiri tidak pernah menerima
+  // id negatif sungguhan karena mesin offline menuliskan ulang semua id sementara ini menjadi
+  // id asli dari server sesaat setelah tersinkron (lihat rewriteRefs_ di engine.js).
+  function refId(v, label) {
+    var n = int(v, label, -1e12, 1e12);
+    if (n === 0) { fail(label + ' tidak valid.'); }
+    return n;
+  }
+
+  /* ---------- kripto ---------- */
+  function hashPw(salt, pw) {
+    var h = pw;
+    for (var i = 0; i < 100; i++) { h = P.sha256(salt + ':' + h + ':' + pw); }
+    return h;
+  }
+  function newSalt() { return P.sha256(P.secret() + ':' + Math.random() + ':' + new Date().getTime()).slice(0, 24); }
+  function sign(msg) { var s = P.secret(); return P.sha256(s + ':' + P.sha256(s + ':' + msg)).slice(0, 40); }
+  function makeToken(u) {
+    var exp = Math.floor(P.now().getTime() / 1000) + SESSION_HOURS * 3600;
+    var body = u.id + '.' + exp + '.' + u.pass_hash.slice(0, 8);
+    return body + '.' + sign(body);
+  }
+  function authUser(token, roles) {
+    var t = String(token || '').split('.');
+    if (t.length !== 4) { fail('Sesi berakhir. Silakan masuk kembali.', 'AUTH'); }
+    var body = t[0] + '.' + t[1] + '.' + t[2];
+    if (sign(body) !== t[3]) { fail('Sesi tidak valid. Silakan masuk kembali.', 'AUTH'); }
+    if (Number(t[1]) < Math.floor(P.now().getTime() / 1000)) { fail('Sesi berakhir. Silakan masuk kembali.', 'AUTH'); }
+    var u = db.all('Users').filter(function (x) { return x.id === Number(t[0]); })[0];
+    if (!u || !u.active || u.pass_hash.slice(0, 8) !== t[2]) { fail('Sesi tidak valid. Silakan masuk kembali.', 'AUTH'); }
+    if (roles && roles.indexOf(u.role) < 0) { fail('Anda tidak memiliki hak akses untuk fitur ini.', 'FORBIDDEN'); }
+    return u;
+  }
+
+  /* ---------- pengaturan ---------- */
+  function currentYY() { return pad_(wib_(P.now()).y % 100, 2); }
+  function loadSettings() {
+    var kv = db.kv(), s = {}, k;
+    for (k in SETTING_DEFAULTS) { s[k] = Object.prototype.hasOwnProperty.call(kv, k) ? kv[k] : SETTING_DEFAULTS[k]; }
+    var parts = [], i = 0;
+    while (kv['store_logo_' + i] !== undefined && kv['store_logo_' + i] !== '') { parts.push(kv['store_logo_' + i]); i++; }
+    var yy = currentYY();
+    var qrisReady = kv['qris_image_0'] !== undefined && kv['qris_image_0'] !== '';
+    var next = (kv.inv_year === yy) ? (Number(kv.inv_next) || 1) : 1;
+    return {
+      store_name: s.store_name, store_address: s.store_address, store_phone: s.store_phone, store_email: s.store_email,
+      tax_no: s.tax_no, bank_name: s.bank_name, bank_account: s.bank_account, bank_holder: s.bank_holder,
+      tax_rate: Number(s.tax_rate) || 0, paper_width: Number(s.paper_width) === 58 ? 58 : 80,
+      receipt_footer: s.receipt_footer, show_logo_on_receipt: s.show_logo_on_receipt === '1',
+      auto_print: s.auto_print === '1', inv_code: s.inv_code || '200', inv_next: next, inv_yy: yy,
+      inv_preview: yy + '-' + (s.inv_code || '200') + '-' + pad_(next, 6),
+      store_logo: parts.join(''), qris_ready: qrisReady
+    };
+  }
+  function invoiceEligible(t) {
+    return t.customer_id > 0 && (t.method === 'cash' || t.method === 'transfer') && t.status === 'completed';
+  }
+
+  /* ---------- bentuk data keluar ---------- */
+  function pubUser(u) { return { id: u.id, username: u.username, full_name: u.full_name, role: u.role }; }
+  function pubProduct(p, withCost) {
+    var o = { id: p.id, type: p.type, category: p.category, sku: p.sku, barcode: p.barcode, name: p.name, unit: p.unit,
+              price: p.price, stock: p.stock, min_stock: p.min_stock, track_stock: p.track_stock };
+    if (withCost) { o.cost_price = p.cost_price; }
+    return o;
+  }
+  function pubCustomer(c) { return { id: c.id, name: c.name, phone: c.phone, email: c.email, address: c.address }; }
+  function txPayload(t, items) {
+    return {
+      id: t.id, invoice_no: t.invoice_no, date: t.date, user_id: t.user_id, cashier: t.user_name,
+      customer_id: t.customer_id, customer: t.customer_name, customer_addr: t.customer_addr,
+      items: items.map(function (i) { return { product_id: i.product_id, name: i.name, type: i.type, qty: i.qty, price: i.price, subtotal: i.subtotal }; }),
+      subtotal: t.subtotal, discount_type: t.discount_type, discount_value: t.discount_value, discount_amount: t.discount_amount,
+      tax_rate: t.tax_rate, tax_amount: t.tax_amount, grand_total: t.grand_total, method: t.method,
+      amount_paid: t.amount_paid, change: t.change, status: t.status, note: t.note, invoice_eligible: invoiceEligible(t)
+    };
+  }
+  function txSummary(t) {
+    return { id: t.id, invoice_no: t.invoice_no, date: t.date, user_id: t.user_id, cashier: t.user_name, customer: t.customer_name,
+             method: t.method, grand_total: t.grand_total, status: t.status, invoice_eligible: invoiceEligible(t) };
+  }
+
+  /* ---------- hitung total (dipakai checkout & data contoh) ---------- */
+  function computeTotals(subtotal, discType, discValue, taxRate) {
+    var disc = 0;
+    if (discType === 'percent') { disc = round0_(subtotal * discValue / 100); }
+    else if (discType === 'amount') { disc = round0_(discValue); }
+    disc = Math.min(disc, subtotal);
+    var taxable = subtotal - disc;
+    var tax = round0_(taxable * taxRate / 100);
+    return { discount: disc, tax: tax, grand: taxable + tax };
+  }
+  function invoiceNo(yy, code, seq) { return yy + '-' + code + '-' + pad_(seq, 6); }
+
+  /* ================================================================
+     AKSI
+     ================================================================ */
+  var A = {};
+
+  /* ----- publik ----- */
+  A.publicInfo = { auth: false, run: function () {
+    var s = loadSettings();
+    return { store_name: s.store_name, store_logo: s.store_logo, version: APP_VERSION };
+  } };
+
+  A.login = { auth: false, write: true, run: function (p) {
+    var uname = str(p.username, 50, 'Username', true).toLowerCase();
+    var pw = String(p.password || '');
+    var key = 'fail:' + uname;
+    var fails = Number(P.cacheGet(key) || 0);
+    if (fails >= 5) { fail('Terlalu banyak percobaan gagal. Coba lagi dalam 10 menit.', 'LOCK'); }
+    var u = db.all('Users').filter(function (x) { return x.username.toLowerCase() === uname; })[0];
+    if (!u || !u.active || hashPw(u.salt, pw) !== u.pass_hash) {
+      P.cachePut(key, String(fails + 1), 600);
+      fail('Username atau password salah.', 'LOGIN');
+    }
+    P.cachePut(key, '0', 1);
+    db.update('Users', u.id, { last_login: fmtDateTime_(P.now()) });
+    return { token: makeToken(u), user: pubUser(u), default_password: u.username === 'admin' && hashPw(u.salt, 'admin123') === u.pass_hash };
+  } };
+
+  /* ----- semua user yang login ----- */
+  A.bootstrap = { roles: ['admin', 'kasir'], run: function (p, user) {
+    return {
+      user: pubUser(user),
+      settings: loadSettings(),
+      products: db.all('Products').map(function (p) { return pubProduct(p, false); }),
+      categories: db.all('Categories').map(function (c) { return c.name; }),
+      customers: db.all('Customers').map(pubCustomer)
+    };
+  } };
+
+  A.checkout = { roles: ['admin', 'kasir'], write: true, run: function (p, user) {
+    var raw = p.items;
+    if (!Array.isArray(raw) || !raw.length) { fail('Keranjang masih kosong.'); }
+    if (raw.length > 200) { fail('Terlalu banyak item dalam satu transaksi (maksimal 200).'); }
+    var qtyById = {}, order = [];
+    raw.forEach(function (it) {
+      var pid = refId(it && it.product_id, 'Produk');
+      var q = int(it && it.qty, 'Jumlah', 1, 999999);
+      if (!qtyById[pid]) { qtyById[pid] = 0; order.push(pid); }
+      qtyById[pid] += q;
+    });
+
+    var customer = null;
+    if (p.customer_id) {
+      var cid = refId(p.customer_id, 'Pelanggan');
+      customer = db.all('Customers').filter(function (c) { return c.id === cid; })[0];
+      if (!customer) { fail('Pelanggan tidak ditemukan (mungkin sudah dihapus).'); }
+    }
+    var discType = p.discount_type || 'none';
+    if (['none', 'percent', 'amount'].indexOf(discType) < 0) { fail('Jenis diskon tidak valid.'); }
+    var discValue = 0;
+    if (discType !== 'none') {
+      discValue = num(p.discount_value || 0, 'Diskon', 0, 1e12);
+      if (discType === 'percent' && discValue > 100) { fail('Diskon persen tidak boleh lebih dari 100.'); }
+      if (discValue === 0) { discType = 'none'; }
+    }
+    var method = String(p.payment_method || '');
+    if (METHODS.indexOf(method) < 0) { fail('Metode pembayaran tidak valid.'); }
+    var note = str(p.note, 200, 'Catatan', false);
+
+    var settings = loadSettings();
+    var products = db.all('Products');
+    var byId = {};
+    products.forEach(function (x) { byId[x.id] = x; });
+
+    var lines = [], subtotal = 0;
+    order.forEach(function (pid) {
+      var pr = byId[pid], q = qtyById[pid];
+      if (!pr) { fail('Ada produk yang sudah dihapus. Muat ulang halaman kasir.'); }
+      if (pr.track_stock && pr.stock < q) { fail('Stok "' + pr.name + '" tidak cukup (tersisa ' + pr.stock + ', diminta ' + q + ').'); }
+      var sub = round2_(pr.price * q);
+      subtotal += sub;
+      lines.push({ pr: pr, qty: q, subtotal: sub });
+    });
+    subtotal = round2_(subtotal);
+    var tot = computeTotals(subtotal, discType, discValue, settings.tax_rate);
+    var paid = tot.grand, change = 0;
+    if (method === 'cash') {
+      paid = num(p.amount_paid || 0, 'Uang diterima', 0, 1e13);
+      if (paid + 0.0001 < tot.grand) { fail('Uang yang diterima kurang dari total belanja.'); }
+      change = round2_(paid - tot.grand);
+    }
+
+    // nomor invoice otomatis: YY-KODE-URUT6, urutan mulai 1 tiap tahun
+    var now = P.now(), yy = currentYY();
+    var kv = db.kv();
+    var seq = (kv.inv_year === yy) ? (Number(kv.inv_next) || 1) : 1;
+    var no = invoiceNo(yy, settings.inv_code, seq);
+
+    var tx = db.insert('Transactions', {
+      invoice_no: no, date: fmtDateTime_(now), user_id: user.id, user_name: user.full_name,
+      customer_id: customer ? customer.id : 0, customer_name: customer ? customer.name : '', customer_addr: customer ? customer.address : '',
+      subtotal: subtotal, discount_type: discType, discount_value: discValue, discount_amount: tot.discount,
+      tax_rate: settings.tax_rate, tax_amount: tot.tax, grand_total: tot.grand,
+      method: method, amount_paid: paid, change: change, status: 'completed', note: note
+    });
+    var itemRows = lines.map(function (l) {
+      return { tx_id: tx.id, invoice_no: no, date: tx.date, user_id: user.id, product_id: l.pr.id, name: l.pr.name, type: l.pr.type,
+               qty: l.qty, price: l.pr.price, cost: l.pr.cost_price, subtotal: l.subtotal };
+    });
+    var saved = db.insertMany('TxItems', itemRows);
+    lines.forEach(function (l) {
+      if (l.pr.track_stock) { db.update('Products', l.pr.id, { stock: l.pr.stock - l.qty }); }
+    });
+    db.kvWrite({ inv_year: yy, inv_next: String(seq + 1) }, []);
+    return txPayload(tx, saved);
+  } };
+
+  A.txList = { roles: ['admin', 'kasir'], run: function (p, user) {
+    var today = fmtDate_(P.now());
+    var from = isYmd_(p.from) ? p.from : today, to = isYmd_(p.to) ? p.to : today;
+    if (to < from) { var t0 = from; from = to; to = t0; }
+    var q = String(p.q || '').toLowerCase().trim();
+    var uid = user.role === 'admin' ? Number(p.user_id || 0) : user.id;
+    var rows = db.all('Transactions').filter(function (t) {
+      var d = t.date.slice(0, 10);
+      if (d < from || d > to) { return false; }
+      if (uid && t.user_id !== uid) { return false; }
+      if (q && (t.invoice_no + ' ' + t.customer_name + ' ' + t.user_name).toLowerCase().indexOf(q) < 0) { return false; }
+      return true;
+    });
+    rows.sort(function (a, b) { return b.id - a.id; });
+    var total = rows.length;
+    return { total: total, from: from, to: to, rows: rows.slice(0, 300).map(txSummary) };
+  } };
+
+  function loadTx(id, user) {
+    id = refId(id, 'Transaksi');
+    var t = db.all('Transactions').filter(function (x) { return x.id === id; })[0];
+    if (!t) { fail('Transaksi tidak ditemukan.'); }
+    if (user.role !== 'admin' && t.user_id !== user.id) { fail('Anda hanya dapat melihat transaksi milik sendiri.', 'FORBIDDEN'); }
+    var items = db.all('TxItems').filter(function (i) { return i.tx_id === t.id; });
+    return txPayload(t, items);
+  }
+  A.txGet = { roles: ['admin', 'kasir'], run: function (p, user) { return loadTx(p.id, user); } };
+  A.invoiceGet = { roles: ['admin', 'kasir'], run: function (p, user) {
+    var t = loadTx(p.id, user);
+    if (!t.invoice_eligible) { fail('Invoice hanya untuk pelanggan terdaftar dengan pembayaran tunai atau transfer.'); }
+    var c = db.all('Customers').filter(function (x) { return x.id === t.customer_id; })[0];
+    if (c) { t.customer = c.name; t.customer_addr = c.address; }
+    return t;
+  } };
+
+  /* ----- service / reparasi ----- */
+  function pubService(x) { return { id:x.id, service_no:x.service_no, date_in:x.date_in, date_out:x.date_out, customer_name:x.customer_name, phone:x.phone, item_name:x.item_name, item_color:x.item_color, completeness:x.completeness, problem:x.problem, status:x.status, received_by:x.received_by, received_by_name:x.received_by_name, picked_up_at:x.picked_up_at, note:x.note }; }
+  A.serviceList = { roles: ['admin','kasir'], run: function (p, user) {
+    var q = String(p.q || '').toLowerCase().trim(), status = String(p.status || 'all');
+    var rows = db.all('Services').filter(function(x){
+      if (status !== 'all' && x.status !== status) return false;
+      if (q && (x.service_no+' '+x.customer_name+' '+x.phone+' '+x.item_name).toLowerCase().indexOf(q)<0) return false;
+      return true;
+    }).sort(function(a,b){ return b.id-a.id; });
+    return { rows: rows.slice(0,500).map(pubService) };
+  } };
+  A.serviceSave = { roles: ['admin','kasir'], write: true, run: function(p,user) {
+    var id = p.id ? int(p.id,'Service',1,1e12) : 0;
+    var statuses = ['proses','tersedia','diambil'];
+    var status = p.status ? String(p.status) : 'proses';
+    if (statuses.indexOf(status)<0) fail('Status service tidak valid.');
+    var o = { customer_name:str(p.customer_name,100,'Nama pelanggan',true), phone:str(p.phone,30,'Nomor HP',true), item_name:str(p.item_name,150,'Nama barang',true), item_color:str(p.item_color,80,'Warna',false), completeness:str(p.completeness,300,'Kelengkapan',false), problem:str(p.problem,1000,'Masalah',true), status:status, note:str(p.note,300,'Catatan',false) };
+    var now=fmtDateTime_(P.now());
+    if (id) { var old=db.all('Services').filter(function(x){return x.id===id;})[0]; if(!old) fail('Data service tidak ditemukan.'); if(status==='diambil' && old.status!=='diambil') o.picked_up_at=now; return pubService(db.update('Services',id,o)); }
+    var yy=currentYY(), seq=Number(db.kv().service_next||1), no=yy+'-SRV-'+pad_(seq,6);
+    o.service_no=no; o.date_in=now; o.date_out=''; o.received_by=user.id; o.received_by_name=user.full_name; o.picked_up_at='';
+    var res=db.insert('Services',o); db.kvWrite({service_next:String(seq+1)},[]); return pubService(res);
+  } };
+  A.serviceGet = { roles: ['admin','kasir'], run: function(p){ var x=db.all('Services').filter(function(a){return a.id===int(p.id,'Service',1,1e12);})[0]; if(!x) fail('Data service tidak ditemukan.'); return pubService(x); } };
+
+  /* ----- produk (admin) ----- */
+  A.productList = { roles: ['admin'], run: function () {
+    return { products: db.all('Products').map(function (p) { return pubProduct(p, true); }), categories: db.all('Categories').map(function (c) { return c.name; }) };
+  } };
+
+  A.productSave = { roles: ['admin'], write: true, run: function (p, user) {
+    var type = p.type === 'jasa' ? 'jasa' : 'barang';
+    var o = {
+      type: type, name: str(p.name, 150, 'Nama', true), category: str(p.category, 60, 'Kategori', false),
+      sku: str(p.sku, 50, 'SKU', false), barcode: str(p.barcode, 64, 'Barcode', false), unit: str(p.unit, 20, 'Satuan', false) || (type === 'jasa' ? 'jasa' : 'pcs'),
+      price: num(p.price, 'Harga jual', 0, 1e12), cost_price: num(p.cost_price || 0, 'Harga modal', 0, 1e12),
+      min_stock: int(p.min_stock || 0, 'Stok minimum', 0, 1e9),
+      track_stock: type === 'barang' && p.track_stock !== false
+    };
+    var all = db.all('Products'), id = p.id ? refId(p.id, 'Produk') : 0;
+    all.forEach(function (x) {
+      if (x.id === id) { return; }
+      if (o.sku && x.sku.toLowerCase() === o.sku.toLowerCase()) { fail('SKU "' + o.sku + '" sudah dipakai produk "' + x.name + '".'); }
+      if (o.barcode && x.barcode === o.barcode) { fail('Barcode "' + o.barcode + '" sudah dipakai produk "' + x.name + '".'); }
+    });
+    if (o.category) {
+      var has = db.all('Categories').some(function (c) { return c.name.toLowerCase() === o.category.toLowerCase(); });
+      if (!has) { db.insert('Categories', { name: o.category }); }
+    }
+    var res;
+    if (id) {
+      if (!all.some(function (x) { return x.id === id; })) { fail('Produk tidak ditemukan.'); }
+      res = db.update('Products', id, o);
+    } else {
+      o.stock = o.track_stock ? int(p.stock || 0, 'Stok awal', 0, 1e9) : 0;
+      o.created_at = fmtDateTime_(P.now());
+      res = db.insert('Products', o);
+      if (o.stock > 0) { db.insert('StockLog', { date: o.created_at, product_id: res.id, name: res.name, user_name: user.full_name, type: 'awal', change: o.stock, before: 0, after: o.stock, note: 'Stok awal' }); }
+    }
+    return pubProduct(res, true);
+  } };
+
+  A.productDelete = { roles: ['admin'], write: true, run: function (p) {
+    var ids = idList(p.ids);
+    return { deleted: db.removeMany('Products', ids) };
+  } };
+
+  A.productStock = { roles: ['admin'], write: true, run: function (p, user) {
+    var id = refId(p.id, 'Produk'), mode = String(p.mode);
+    var pr = db.all('Products').filter(function (x) { return x.id === id; })[0];
+    if (!pr) { fail('Produk tidak ditemukan.'); }
+    if (!pr.track_stock) { fail('Produk ini tidak memakai stok (jasa / stok tidak dilacak).'); }
+    var q = int(p.qty, 'Jumlah', 0, 1e9), after;
+    if (mode === 'add') { after = pr.stock + q; }
+    else if (mode === 'sub') { after = pr.stock - q; if (after < 0) { fail('Stok tidak bisa kurang dari 0 (stok saat ini ' + pr.stock + ').'); } }
+    else if (mode === 'set') { after = q; }
+    else { fail('Jenis penyesuaian stok tidak valid.'); }
+    var res = db.update('Products', id, { stock: after });
+    db.insert('StockLog', { date: fmtDateTime_(P.now()), product_id: id, name: pr.name, user_name: user.full_name, type: mode, change: after - pr.stock, before: pr.stock, after: after, note: str(p.note, 150, 'Catatan', false) });
+    return pubProduct(res, true);
+  } };
+
+  /* ----- pelanggan (admin) ----- */
+  A.customerList = { roles: ['admin'], run: function () {
+    return { customers: db.all('Customers').map(pubCustomer) };
+  } };
+  A.customerSave = { roles: ['admin'], write: true, run: function (p) {
+    var o = {
+      name: str(p.name, 100, 'Nama pelanggan', true), phone: str(p.phone, 30, 'Telepon', false),
+      email: str(p.email, 100, 'Email', false), address: str(p.address, 250, 'Alamat', false)
+    };
+    if (o.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(o.email)) { fail('Format email tidak valid.'); }
+    var id = p.id ? refId(p.id, 'Pelanggan') : 0, res;
+    if (id) {
+      if (!db.all('Customers').some(function (c) { return c.id === id; })) { fail('Pelanggan tidak ditemukan.'); }
+      res = db.update('Customers', id, o);
+    } else {
+      o.created_at = fmtDateTime_(P.now());
+      res = db.insert('Customers', o);
+    }
+    return pubCustomer(res);
+  } };
+  A.customerDelete = { roles: ['admin'], write: true, run: function (p) {
+    return { deleted: db.removeMany('Customers', idList(p.ids)) };
+  } };
+
+  /* ----- pengguna (admin) ----- */
+  function pubUserFull(u) {
+    return { id: u.id, username: u.username, full_name: u.full_name, role: u.role, active: u.active, last_login: u.last_login, created_at: u.created_at };
+  }
+  function activeAdmins(users, exceptIds) {
+    return users.filter(function (u) { return u.role === 'admin' && u.active && exceptIds.indexOf(u.id) < 0; }).length;
+  }
+  A.userList = { roles: ['admin'], run: function () {
+    return { users: db.all('Users').map(pubUserFull) };
+  } };
+  A.userSave = { roles: ['admin'], write: true, run: function (p, me) {
+    var users = db.all('Users');
+    var id = p.id ? refId(p.id, 'User') : 0;
+    var role = String(p.role);
+    if (ROLES.indexOf(role) < 0) { fail('Peran user tidak valid.'); }
+    var full = str(p.full_name, 100, 'Nama lengkap', true);
+    var active = p.active !== false;
+    var pw = String(p.password || '');
+    if (id) {
+      var u = users.filter(function (x) { return x.id === id; })[0];
+      if (!u) { fail('User tidak ditemukan.'); }
+      if (id === me.id && (role !== 'admin' || !active)) { fail('Anda tidak dapat menurunkan peran atau menonaktifkan akun Anda sendiri.'); }
+      if ((u.role === 'admin' && u.active) && (role !== 'admin' || !active) && activeAdmins(users, [id]) < 1) { fail('Harus tersisa minimal satu Kasir Admin aktif.'); }
+      var patch = { full_name: full, role: role, active: active };
+      if (pw) {
+        if (pw.length < 6) { fail('Password minimal 6 karakter.'); }
+        patch.salt = newSalt(); patch.pass_hash = hashPw(patch.salt, pw);
+      }
+      return pubUserFull(db.update('Users', id, patch));
+    }
+    var uname = str(p.username, 30, 'Username', true).toLowerCase();
+    if (!/^[a-z0-9._-]{3,30}$/.test(uname)) { fail('Username 3-30 karakter: huruf kecil, angka, titik, strip, atau garis bawah.'); }
+    if (users.some(function (x) { return x.username.toLowerCase() === uname; })) { fail('Username "' + uname + '" sudah dipakai.'); }
+    if (pw.length < 6) { fail('Password minimal 6 karakter.'); }
+    var salt = newSalt();
+    return pubUserFull(db.insert('Users', { username: uname, salt: salt, pass_hash: hashPw(salt, pw), full_name: full, role: role, active: active, last_login: '', created_at: fmtDateTime_(P.now()) }));
+  } };
+  A.userDelete = { roles: ['admin'], write: true, run: function (p, me) {
+    var ids = idList(p.ids);
+    if (ids.indexOf(me.id) >= 0) { fail('Anda tidak dapat menghapus akun Anda sendiri.'); }
+    if (activeAdmins(db.all('Users'), ids) < 1) { fail('Harus tersisa minimal satu Kasir Admin aktif.'); }
+    return { deleted: db.removeMany('Users', ids) };
+  } };
+  A.passwordChange = { roles: ['admin', 'kasir'], write: true, run: function (p, me) {
+    var cur = String(p.current || ''), nw = String(p.password || '');
+    if (hashPw(me.salt, cur) !== me.pass_hash) { fail('Password saat ini salah.'); }
+    if (nw.length < 6) { fail('Password baru minimal 6 karakter.'); }
+    var salt = newSalt(), h = hashPw(salt, nw);
+    db.update('Users', me.id, { salt: salt, pass_hash: h });
+    return { token: makeToken({ id: me.id, pass_hash: h }) };
+  } };
+
+  /* ----- gambar QRIS (dibaca kasir saat pembayaran QRIS) ----- */
+  A.qrisGet = { roles: ['admin', 'kasir'], run: function () {
+    var kv = db.kv(), parts = [], i = 0;
+    while (kv['qris_image_' + i] !== undefined && kv['qris_image_' + i] !== '') { parts.push(kv['qris_image_' + i]); i++; }
+    return { image: parts.join('') };
+  } };
+
+  /* ----- pengaturan (admin) ----- */
+  A.settingsSave = { roles: ['admin'], write: true, run: function (p) {
+    var set = {}, del = [], cur = loadSettings();
+    var textKeys = { store_name: [100, true], store_address: [250, false], store_phone: [40, false], store_email: [100, false], tax_no: [40, false],
+                     bank_name: [60, false], bank_account: [60, false], bank_holder: [80, false], receipt_footer: [250, false] };
+    Object.keys(textKeys).forEach(function (k) {
+      if (p[k] !== undefined) { set[k] = str(p[k], textKeys[k][0], k === 'store_name' ? 'Nama toko' : 'Isian', textKeys[k][1]); }
+    });
+    if (p.tax_rate !== undefined) { set.tax_rate = String(num(p.tax_rate, 'Pajak', 0, 100)); }
+    if (p.paper_width !== undefined) { set.paper_width = Number(p.paper_width) === 58 ? '58' : '80'; }
+    if (p.show_logo_on_receipt !== undefined) { set.show_logo_on_receipt = p.show_logo_on_receipt ? '1' : '0'; }
+    if (p.auto_print !== undefined) { set.auto_print = p.auto_print ? '1' : '0'; }
+    if (p.inv_code !== undefined) {
+      var code = str(p.inv_code, 10, 'Kode invoice', true);
+      if (!/^[A-Za-z0-9]{1,10}$/.test(code)) { fail('Kode invoice hanya huruf/angka (contoh: 200).'); }
+      set.inv_code = code;
+    }
+    if (p.inv_next !== undefined && Number(p.inv_next) !== cur.inv_next) {
+      var nx = int(p.inv_next, 'Nomor urut invoice', 1, 999999);
+      var yy = cur.inv_yy, maxSeq = 0;
+      db.all('Transactions').forEach(function (t) {
+        var m = /^(\d{2})-[^-]+-(\d+)$/.exec(t.invoice_no);
+        if (m && m[1] === yy && Number(m[2]) > maxSeq) { maxSeq = Number(m[2]); }
+      });
+      if (nx <= maxSeq) { fail('Nomor urut harus lebih besar dari nomor terakhir yang sudah dipakai tahun ini (' + maxSeq + ').'); }
+      set.inv_year = yy; set.inv_next = String(nx);
+    }
+    var kvNow = db.kv();
+    function imageKeys(prefix) { var re = new RegExp('^' + prefix + '_\\d+$'); return Object.keys(kvNow).filter(function (k) { return re.test(k); }); }
+    function putImage(prefix, data, maxLen, label) {
+      var d = String(data);
+      if (!/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+\/=]+$/.test(d)) { fail('Format ' + label + ' harus PNG, JPG, atau WebP.'); }
+      if (d.length > maxLen) { fail('Ukuran ' + label + ' terlalu besar. Gunakan gambar yang lebih kecil.'); }
+      imageKeys(prefix).forEach(function (k) { del.push(k); });
+      for (var i = 0, n = 0; i < d.length; i += 40000, n++) { set[prefix + '_' + n] = d.slice(i, i + 40000); }
+      del = del.filter(function (k) { return !Object.prototype.hasOwnProperty.call(set, k); });
+    }
+    if (p.logo_delete) { imageKeys('store_logo').forEach(function (k) { del.push(k); }); }
+    else if (p.logo) { putImage('store_logo', p.logo, 300000, 'logo'); }
+    if (p.qris_delete) { imageKeys('qris_image').forEach(function (k) { del.push(k); }); }
+    else if (p.qris) { putImage('qris_image', p.qris, 400000, 'gambar QRIS'); }
+    db.kvWrite(set, del);
+    return loadSettings();
+  } };
+
+  /* ================================================================
+     LAPORAN
+     ================================================================ */
+  function normRange(p) {
+    var today = fmtDate_(P.now());
+    var from = isYmd_(p.from) ? p.from : today, to = isYmd_(p.to) ? p.to : today;
+    if (to < from) { var t = from; from = to; to = t; }
+    if (diffDays_(from, to) > 400) { fail('Rentang laporan maksimal 400 hari.'); }
+    return { from: from, to: to };
+  }
+  function txInRange(r) {
+    return db.all('Transactions').filter(function (t) { var d = t.date.slice(0, 10); return t.status === 'completed' && d >= r.from && d <= r.to; });
+  }
+  function itemsInRange(r) {
+    return db.all('TxItems').filter(function (i) { var d = i.date.slice(0, 10); return d >= r.from && d <= r.to; });
+  }
+  function costByTx(items) {
+    var m = {};
+    items.forEach(function (i) { m[i.tx_id] = (m[i.tx_id] || 0) + i.cost * i.qty; });
+    return m;
+  }
+  function netOf(t) { return t.subtotal - t.discount_amount; }
+
+  A.dashboard = { roles: ['admin'], run: function (p) {
+    var r = normRange(p);
+    var txs = txInRange(r), items = itemsInRange(r), cost = costByTx(items);
+    var k = { sales: 0, tx: txs.length, qty: 0, profit: 0, discount: 0, tax: 0 };
+    var dayMap = {}, methods = {};
+    var n = diffDays_(r.from, r.to);
+    for (var d = 0; d <= n; d++) { var ds = addDays_(r.from, d); dayMap[ds] = { date: ds, sales: 0, tx: 0, qty: 0 }; }
+    txs.forEach(function (t) {
+      k.sales += t.grand_total; k.discount += t.discount_amount; k.tax += t.tax_amount;
+      k.profit += netOf(t) - (cost[t.id] || 0);
+      var dm = dayMap[t.date.slice(0, 10)]; dm.sales += t.grand_total; dm.tx += 1;
+      var m = methods[t.method] || (methods[t.method] = { method: t.method, tx: 0, sales: 0 });
+      m.tx += 1; m.sales += t.grand_total;
+    });
+    var prod = {}, byType = { barang: { qty: 0, sales: 0 }, jasa: { qty: 0, sales: 0 } };
+    items.forEach(function (i) {
+      k.qty += i.qty;
+      dayMap[i.date.slice(0, 10)].qty += i.qty;
+      var key = i.product_id;
+      var e = prod[key] || (prod[key] = { product_id: i.product_id, name: i.name, type: i.type, qty: 0, sales: 0, profit: 0 });
+      e.name = i.name; e.qty += i.qty; e.sales += i.subtotal; e.profit += i.subtotal - i.cost * i.qty;
+      var bt = byType[i.type === 'jasa' ? 'jasa' : 'barang']; bt.qty += i.qty; bt.sales += i.subtotal;
+    });
+    var itemsOut = Object.keys(prod).map(function (x) { return prod[x]; }).sort(function (a, b) { return b.qty - a.qty || b.sales - a.sales; });
+
+    // periode pembanding: rentang sama panjang tepat sebelum periode ini
+    var len = n + 1, pr = { from: addDays_(r.from, -len), to: addDays_(r.from, -1) };
+    var ptx = txInRange(pr), prevSales = 0;
+    ptx.forEach(function (t) { prevSales += t.grand_total; });
+
+    var low = db.all('Products').filter(function (x) { return x.track_stock && x.stock <= x.min_stock; })
+      .sort(function (a, b) { return a.stock - b.stock; }).slice(0, 12)
+      .map(function (x) { return { id: x.id, name: x.name, stock: x.stock, min_stock: x.min_stock, unit: x.unit }; });
+
+    return {
+      range: r, kpi: k, prev: { sales: prevSales, tx: ptx.length, from: pr.from, to: pr.to },
+      daily: Object.keys(dayMap).sort().map(function (x) { return dayMap[x]; }),
+      methods: Object.keys(methods).map(function (x) { return methods[x]; }).sort(function (a, b) { return b.sales - a.sales; }),
+      items: itemsOut, byType: byType, low_stock: low
+    };
+  } };
+
+  A.userReport = { roles: ['admin'], run: function (p) {
+    var r = normRange(p);
+    var txs = txInRange(r), items = itemsInRange(r), cost = costByTx(items);
+    var users = db.all('Users'), evals = db.all('Evaluations').filter(function (e) { return e.from === r.from && e.to === r.to; });
+    var map = {};
+    function ensure(uid, name, username, role, active, deleted) {
+      return map[uid] || (map[uid] = { user_id: uid, name: name, username: username, role: role, active: active, deleted: deleted,
+        tx: 0, qty: 0, sales: 0, profit: 0, days: {}, first: '', last: '', prod: {}, daily: {} });
+    }
+    users.forEach(function (u) { ensure(u.id, u.full_name, u.username, u.role, u.active, false); });
+    var total = { tx: 0, qty: 0, sales: 0, profit: 0 };
+    txs.forEach(function (t) {
+      var e = ensure(t.user_id, t.user_name, '', '', false, true);
+      e.tx += 1; e.sales += t.grand_total; e.profit += netOf(t) - (cost[t.id] || 0);
+      var d = t.date.slice(0, 10); e.days[d] = 1; e.daily[d] = (e.daily[d] || 0) + t.grand_total;
+      if (!e.first || t.date < e.first) { e.first = t.date; }
+      if (!e.last || t.date > e.last) { e.last = t.date; }
+      total.tx += 1; total.sales += t.grand_total; total.profit += netOf(t) - (cost[t.id] || 0);
+    });
+    items.forEach(function (i) {
+      var e = map[i.user_id]; if (!e) { return; }
+      e.qty += i.qty; total.qty += i.qty;
+      var x = e.prod[i.product_id] || (e.prod[i.product_id] = { name: i.name, type: i.type, qty: 0, sales: 0 });
+      x.name = i.name; x.qty += i.qty; x.sales += i.subtotal;
+    });
+    var out = Object.keys(map).map(function (id) {
+      var e = map[id], ev = evals.filter(function (x) { return x.user_id === e.user_id; })[0];
+      var list = Object.keys(e.prod).map(function (k) { return e.prod[k]; }).sort(function (a, b) { return b.sales - a.sales; });
+      return {
+        user_id: e.user_id, name: e.name, username: e.username, role: e.role, active: e.active, deleted: e.deleted,
+        tx: e.tx, qty: e.qty, sales: e.sales, profit: e.profit, avg: e.tx ? Math.round(e.sales / e.tx) : 0,
+        days: Object.keys(e.days).length, first: e.first, last: e.last,
+        share: total.sales ? e.sales / total.sales : 0,
+        items: list, daily: Object.keys(e.daily).sort().map(function (d) { return { date: d, sales: e.daily[d] }; }),
+        eval: ev ? { rating: ev.rating, bonus: ev.bonus, note: ev.note, updated_by: ev.updated_by, updated_at: ev.updated_at } : null
+      };
+    }).filter(function (e) { return !e.deleted || e.tx > 0; })
+      .sort(function (a, b) { return b.sales - a.sales || a.name.localeCompare(b.name); });
+    return { range: r, total: total, users: out };
+  } };
+
+  A.evalSave = { roles: ['admin'], write: true, run: function (p, me) {
+    var r = normRange(p), uid = refId(p.user_id, 'User');
+    var o = { user_id: uid, from: r.from, to: r.to, rating: int(p.rating || 0, 'Penilaian', 0, 5), bonus: num(p.bonus || 0, 'Bonus', 0, 1e12),
+              note: str(p.note, 250, 'Catatan', false), updated_at: fmtDateTime_(P.now()), updated_by: me.full_name };
+    var ex = db.all('Evaluations').filter(function (e) { return e.user_id === uid && e.from === r.from && e.to === r.to; })[0];
+    if (ex) { db.update('Evaluations', ex.id, o); } else { db.insert('Evaluations', o); }
+    return { rating: o.rating, bonus: o.bonus, note: o.note, updated_by: o.updated_by, updated_at: o.updated_at };
+  } };
+
+  /* ----- sinkronisasi offline (PWA/Android) ----- */
+  A.syncPull = { roles: ['admin', 'kasir'], run: function (p, user) {
+    // Catatan keamanan: baris Users disertakan APA ADANYA (termasuk salt+pass_hash yang
+    // sudah di-hash) supaya perangkat bisa login walau sedang offline. Ini hanya tersimpan
+    // di perangkat sendiri (IndexedDB), bukan dikirim ke pihak lain, dan memerlukan token
+    // sesi yang valid untuk memanggil aksi ini.
+    var days = int(p.days || 180, 'Hari', 1, 3650);
+    var since = fmtDate_(new Date(P.now().getTime() - days * 86400000));
+    var tx = db.all('Transactions').filter(function (t) { return t.date >= since; });
+    var txIds = {}; tx.forEach(function (t) { txIds[t.id] = 1; });
+    var items = db.all('TxItems').filter(function (i) { return txIds[i.tx_id]; });
+    return {
+      server_time: fmtDateTime_(P.now()), days: days,
+      users: db.all('Users'), categories: db.all('Categories'), products: db.all('Products'), customers: db.all('Customers'),
+      transactions: tx, tx_items: items, services: db.all('Services'),
+      evaluations: user.role === 'admin' ? db.all('Evaluations') : [],
+      kv: db.kv()
+    };
+  } };
+
+  /* ================================================================
+     PINTU MASUK
+     ================================================================ */
+  function handle(action, token, payload) {
+    try {
+      var a = A[action];
+      if (!a) { fail('Aksi tidak dikenal.', 'NOACTION'); }
+      var run = function () {
+        var user = null;
+        if (a.auth !== false) { user = authUser(token, a.roles); }
+        return a.run(payload || {}, user);
+      };
+      var data = a.write ? P.lock(run) : run();
+      return { ok: true, data: data };
+    } catch (e) {
+      if (e && e.isApp) { return { ok: false, error: e.message, code: e.code }; }
+      if (P.log) { P.log(e); }
+      return { ok: false, error: 'Terjadi kesalahan pada server: ' + (e && e.message ? e.message : e), code: 'SERVER' };
+    }
+  }
+
+  /* ---------- data awal ---------- */
+  function seedBase() {
+    if (db.all('Users').length === 0) {
+      var salt = newSalt();
+      db.insert('Users', { username: 'admin', salt: salt, pass_hash: hashPw(salt, 'admin123'), full_name: 'Administrator', role: 'admin', active: true, last_login: '', created_at: fmtDateTime_(P.now()) });
+    }
+    var kv = db.kv(), set = {};
+    Object.keys(SETTING_DEFAULTS).forEach(function (k) { if (kv[k] === undefined) { set[k] = SETTING_DEFAULTS[k]; } });
+    if (Object.keys(set).length) { db.kvWrite(set, []); }
+  }
+
+  return {
+    handle: handle, seedBase: seedBase,
+    util: { computeTotals: computeTotals, invoiceNo: invoiceNo, hashPw: hashPw, newSalt: newSalt, fmtDate: fmtDate_, fmtDateTime: fmtDateTime_, addDays: addDays_, loadSettings: loadSettings, wib: wib_ }
+  };
+}
+
+
+/* =====================================================================
+   HDT POS - mesin offline (IndexedDB + logika bisnis yang sama dengan
+   server + antrean sinkronisasi). File Core.gs di atas ini TIDAK diubah
+   sama sekali -- ditempel apa adanya supaya logika kasir/produk/service/dst
+   persis sama saat offline maupun online. Bagian di bawah ini yang
+   menyambungkannya ke IndexedDB dan ke server (fetch, bukan google.script.run,
+   karena halaman ini di-hosting sendiri, bukan lewat script.google.com).
+   ===================================================================== */
+
+/* ---------- sha256 murni-JS (dipakai untuk hash sesi/kata sandi secara lokal) ---------- */
+function sha256Hex_(msg) {
+  var utf8 = unescape(encodeURIComponent(msg));
+  var K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+  var H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  var bytes = [], i, j;
+  for (i = 0; i < utf8.length; i++) { bytes.push(utf8.charCodeAt(i)); }
+  var bitLen = bytes.length * 8;
+  bytes.push(0x80);
+  while (bytes.length % 64 !== 56) { bytes.push(0); }
+  var hi = Math.floor(bitLen / 4294967296), lo = bitLen >>> 0;
+  bytes.push((hi >>> 24) & 255, (hi >>> 16) & 255, (hi >>> 8) & 255, hi & 255, (lo >>> 24) & 255, (lo >>> 16) & 255, (lo >>> 8) & 255, lo & 255);
+  var w = new Array(64);
+  function rotr(x, n) { return (x >>> n) | (x << (32 - n)); }
+  for (var off = 0; off < bytes.length; off += 64) {
+    for (i = 0; i < 16; i++) { j = off + i * 4; w[i] = (bytes[j] << 24) | (bytes[j + 1] << 16) | (bytes[j + 2] << 8) | bytes[j + 3]; }
+    for (i = 16; i < 64; i++) {
+      var s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      var s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+    }
+    var a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+    for (i = 0; i < 64; i++) {
+      var S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25), ch = (e & f) ^ (~e & g);
+      var t1 = (h + S1 + ch + K[i] + w[i]) | 0;
+      var S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22), maj = (a & b) ^ (a & c) ^ (b & c);
+      var t2 = (S0 + maj) | 0;
+      h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+    }
+    H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;
+    H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+  }
+  return H.map(function (x) { return ('00000000' + (x >>> 0).toString(16)).slice(-8); }).join('');
+}
+
+/* ---------- "database" lokal di memori, dicadangkan ke IndexedDB ---------- */
+function localDb_(state, onChange) {
+  function coerce(t, o) {
+    var out = {};
+    SCHEMA[t].forEach(function (c) {
+      var v = o[c[0]];
+      if (c[1] === 'n') { v = (v === '' || v === null || v === undefined) ? 0 : (Number(v) || 0); }
+      else if (c[1] === 'b') { v = (v === true || v === 1 || v === '1'); }
+      else { v = (v === null || v === undefined) ? '' : String(v); }
+      out[c[0]] = v;
+    });
+    return out;
+  }
+  function clone(o) { return JSON.parse(JSON.stringify(o)); }
+  function nextLocalId(t) {
+    // ID sementara: negatif, supaya tidak akan pernah bentrok dengan ID asli dari
+    // server (server selalu memberi ID positif berurutan).
+    var min = 0;
+    state.tables[t].forEach(function (r) { if (r.id < min) { min = r.id; } });
+    return min - 1;
+  }
+  return {
+    all: function (t) { return state.tables[t].map(clone); },
+    insert: function (t, o) {
+      var rows = state.tables[t];
+      var row = coerce(t, Object.assign({}, o, { id: nextLocalId(t) }));
+      rows.push(row); onChange(); return clone(row);
+    },
+    insertMany: function (t, arr) {
+      var rows = state.tables[t], out = [];
+      arr.forEach(function (o) { var row = coerce(t, Object.assign({}, o, { id: nextLocalId(t) })); rows.push(row); out.push(clone(row)); });
+      onChange(); return out;
+    },
+    update: function (t, id, patch) {
+      var row = state.tables[t].filter(function (r) { return r.id === id; })[0];
+      if (!row) { return null; }
+      var merged = coerce(t, Object.assign({}, row, patch, { id: id }));
+      Object.keys(merged).forEach(function (k) { row[k] = merged[k]; });
+      onChange(); return clone(row);
+    },
+    removeMany: function (t, ids) {
+      var before = state.tables[t].length;
+      state.tables[t] = state.tables[t].filter(function (r) { return ids.indexOf(r.id) < 0; });
+      onChange(); return before - state.tables[t].length;
+    },
+    kv: function () { return clone(state.kv); },
+    kvWrite: function (set, del) {
+      Object.keys(set).forEach(function (k) { state.kv[k] = String(set[k]); });
+      (del || []).forEach(function (k) { delete state.kv[k]; });
+      onChange();
+    },
+    /* ---- dipakai khusus mesin sinkronisasi, bukan bagian dari logika Core.gs ---- */
+    replaceRow: function (t, oldId, serverPartial) {
+      var rows = state.tables[t], i = rows.findIndex(function (r) { return r.id === oldId; });
+      var base = i >= 0 ? rows[i] : {};
+      var merged = coerce(t, Object.assign({}, base, serverPartial, { id: serverPartial.id }));
+      if (i >= 0) { rows[i] = merged; } else { rows.push(merged); }
+      onChange(); return clone(merged);
+    },
+    removeWhere: function (t, pred) {
+      state.tables[t] = state.tables[t].filter(function (r) { return !pred(r); });
+      onChange();
+    },
+    insertRaw: function (t, o) {
+      var row = coerce(t, o); state.tables[t].push(row); onChange(); return clone(row);
+    },
+    replaceAll: function (t, arr) {
+      state.tables[t] = (arr || []).map(function (o) { return coerce(t, o); });
+      onChange();
+    },
+    mergeWindow: function (t, arr, keyField, allowedIds) {
+      // Timpa baris di dalam jendela (misalnya transaksi 180 hari terakhir) dengan versi
+      // server, tapi JANGAN buang riwayat lokal yang lebih lama dari jendela tersebut.
+      var incoming = (arr || []).map(function (o) { return coerce(t, o); });
+      var incomingIds = {}; incoming.forEach(function (r) { incomingIds[r.id] = 1; });
+      var kept = state.tables[t].filter(function (r) {
+        if (r.id < 0) { return true; } // punya kandidat lokal yang belum tersinkron -> pertahankan
+        if (allowedIds && keyField) { return allowedIds.indexOf(r[keyField]) < 0; }
+        return !incomingIds[r.id];
+      });
+      state.tables[t] = kept.concat(incoming);
+      onChange();
+    }
+  };
+}
+
+/* ---------- penyimpanan IndexedDB (satu blob JSON per perangkat) ---------- */
+var IDB_NAME = 'hdtpos_offline_v1', IDB_STORE = 'kv';
+function idbOpen_() {
+  return new Promise(function (resolve, reject) {
+    var req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = function () { req.result.createObjectStore(IDB_STORE); };
+    req.onsuccess = function () { resolve(req.result); };
+    req.onerror = function () { reject(req.error); };
+  });
+}
+function idbGet_(key) {
+  return idbOpen_().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      var tx = db.transaction(IDB_STORE, 'readonly');
+      var req = tx.objectStore(IDB_STORE).get(key);
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error); };
+    });
+  });
+}
+function idbSet_(key, value) {
+  return idbOpen_().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      var tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).put(value, key);
+      tx.oncomplete = function () { resolve(); };
+      tx.onerror = function () { reject(tx.error); };
+    });
+  });
+}
+
+/* ---------- alamat Web App (Google Apps Script) ---------- */
+function getWebAppUrl() { try { return localStorage.getItem('hdt_webapp_url') || ''; } catch (e) { return ''; } }
+function setWebAppUrl(u) { try { localStorage.setItem('hdt_webapp_url', u || ''); } catch (e) {} }
+
+/* ---------- state global mesin offline ---------- */
+var OFF = null;                 // { state, db, backend }
+var offlineReady = false;
+var saveTimer_ = null;
+var syncing_ = false;
+var needRelogin_ = false;
+var lastSyncError_ = null;
+var lastPullAt_ = 0;
+
+function scheduleSave_() {
+  if (saveTimer_) { return; }
+  saveTimer_ = setTimeout(function () {
+    saveTimer_ = null;
+    idbSet_('state', OFF.state).catch(function () {});
+  }, 250);
+}
+function flushSaveNow_() {
+  // Simpan segera (tanpa menunggu debounce 250ms) -- dipanggil saat halaman akan
+  // ditutup/disembunyikan supaya perubahan offline terakhir tidak sempat hilang.
+  if (saveTimer_) { clearTimeout(saveTimer_); saveTimer_ = null; }
+  if (OFF && OFF.state) { idbSet_('state', OFF.state).catch(function () {}); }
+}
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') { flushSaveNow_(); } });
+  window.addEventListener('pagehide', flushSaveNow_);
+}
+
+async function initOffline() {
+  var state = null;
+  try { state = await idbGet_('state'); } catch (e) {}
+  if (!state || state.v !== 1) {
+    var tables = {};
+    Object.keys(SCHEMA).forEach(function (k) { if (k !== 'Settings') { tables[k] = []; } });
+    state = { v: 1, secret: sha256Hex_('device' + Math.random() + Date.now()), tables: tables, kv: {}, outbox: [] };
+  }
+  if (!state.outbox) { state.outbox = []; }
+  if (!state.secret) { state.secret = sha256Hex_('device' + Math.random() + Date.now()); }
+  var ldb = localDb_(state, scheduleSave_);
+  var platform = {
+    db: ldb, sha256: sha256Hex_, now: function () { return new Date(); }, lock: function (fn) { return fn(); },
+    secret: function () { return state.secret; }, cacheGet: function () { return null; }, cachePut: function () {}, log: function (e) { console.error(e); }
+  };
+  OFF = { state: state, db: ldb, backend: createBackend_(platform) };
+  offlineReady = true;
+}
+
+/* ---------- panggilan ke server (fetch, bukan google.script.run) ---------- */
+async function serverCall(action, token, payload, timeoutMs) {
+  var url = getWebAppUrl();
+  if (!url) { var e = new Error('Alamat Web App belum diatur.'); e.code = 'NOURL'; throw e; }
+  var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, timeoutMs || 12000) : null;
+  try {
+    var res = await fetch(url + (url.indexOf('?') >= 0 ? '&' : '?') + 'api=1', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // hindari preflight CORS (Apps Script tak bisa menjawabnya)
+      body: JSON.stringify({ action: action, token: token || '', payload: payload || {} }),
+      signal: ctrl ? ctrl.signal : undefined
+    });
+    return await res.json();
+  } finally { if (timer) { clearTimeout(timer); } }
+}
+
+/* ---------- klasifikasi aksi: tabel target + cara antre saat offline ---------- */
+var WRITE_ACTIONS = { checkout: 1, serviceSave: 1, productSave: 1, productDelete: 1, productStock: 1, customerSave: 1, customerDelete: 1, userSave: 1, userDelete: 1, passwordChange: 1, settingsSave: 1, evalSave: 1 };
+var ACTION_TABLE = { serviceSave: 'Services', productSave: 'Products', productDelete: 'Products', productStock: 'Products', customerSave: 'Customers', customerDelete: 'Customers', userSave: 'Users', userDelete: 'Users', checkout: 'Transactions' };
+var SAVE_ACTIONS = { serviceSave: 1, productSave: 1, customerSave: 1, userSave: 1 };
+var DELETE_ACTIONS = { productDelete: 1, customerDelete: 1, userDelete: 1 };
+var FK_RULES = {
+  checkout: [{ table: 'Customers', kind: 'scalar', field: 'customer_id' }, { table: 'Products', kind: 'arrayField', field: 'items', sub: 'product_id' }],
+  productStock: [{ table: 'Products', kind: 'scalar', field: 'id' }],
+  productDelete: [{ table: 'Products', kind: 'array', field: 'ids' }],
+  customerDelete: [{ table: 'Customers', kind: 'array', field: 'ids' }],
+  userDelete: [{ table: 'Users', kind: 'array', field: 'ids' }],
+  evalSave: [{ table: 'Users', kind: 'scalar', field: 'user_id' }]
+};
+function rewriteRefs_(payload, action, table, oldId, newId) {
+  var rules = FK_RULES[action]; if (!rules || !payload) { return; }
+  rules.forEach(function (r) {
+    if (r.table !== table) { return; }
+    if (r.kind === 'scalar') { if (payload[r.field] === oldId) { payload[r.field] = newId; } }
+    else if (r.kind === 'array') { var a = payload[r.field]; if (Array.isArray(a)) { for (var i = 0; i < a.length; i++) { if (a[i] === oldId) { a[i] = newId; } } } }
+    else if (r.kind === 'arrayField') { var arr = payload[r.field]; if (Array.isArray(arr)) { arr.forEach(function (it) { if (it && it[r.sub] === oldId) { it[r.sub] = newId; } }); } }
+  });
+}
+function isPendingId_(id) { return typeof id === 'number' && id < 0; }
+function uid_() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+function findPendingCreate_(table, localId) {
+  return OFF.state.outbox.find(function (e) { return e.mode === 'create' && e.table === table && e.localId === localId; });
+}
+function cancelPendingCreate_(table, localId) {
+  var i = OFF.state.outbox.findIndex(function (e) { return e.mode === 'create' && e.table === table && e.localId === localId; });
+  if (i >= 0) { OFF.state.outbox.splice(i, 1); }
+}
+function touchOutbox_() { scheduleSave_(); updateSyncBadge(); }
+
+/** Dipanggil setelah aksi tulis berhasil dijalankan secara LOKAL, untuk menentukan
+ *  apakah & bagaimana perubahan ini perlu diantre menunggu koneksi internet. */
+function afterLocalWrite_(action, payload, localResult) {
+  if (!WRITE_ACTIONS[action]) { return; }
+  var table = ACTION_TABLE[action];
+
+  if (action === 'productStock' && isPendingId_(payload.id)) {
+    var pend = findPendingCreate_('Products', payload.id);
+    if (pend) { pend.payload.stock = localResult.stock; touchOutbox_(); return; }
+  }
+  if (SAVE_ACTIONS[action] && payload.id && isPendingId_(payload.id)) {
+    var pend2 = findPendingCreate_(table, payload.id);
+    if (pend2) { pend2.payload = Object.assign({}, payload, { id: 0 }); touchOutbox_(); return; }
+  }
+  if (DELETE_ACTIONS[action]) {
+    var real = [];
+    (payload.ids || []).forEach(function (id) {
+      if (isPendingId_(id)) { cancelPendingCreate_(table, id); } else { real.push(id); }
+    });
+    if (!real.length) { touchOutbox_(); return; }
+    payload = Object.assign({}, payload, { ids: real });
+  }
+
+  var isCreate = (SAVE_ACTIONS[action] && !payload.id) || action === 'checkout';
+  OFF.state.outbox.push({
+    id: uid_(), action: action, payload: payload, table: table,
+    mode: isCreate ? 'create' : 'other', localId: isCreate ? localResult.id : null,
+    ts: new Date().toISOString()
+  });
+  touchOutbox_();
+}
+
+/* ---------- antrean -> server, saat online ---------- */
+async function flushOutbox() {
+  if (syncing_ || !offlineReady) { return; }
+  if (!navigator.onLine || !getWebAppUrl() || !S.token) { return; }
+  syncing_ = true; updateSyncBadge();
+  try {
+    while (OFF.state.outbox.length) {
+      var entry = OFF.state.outbox[0], res;
+      try { res = await serverCall(entry.action, S.token, entry.payload, 15000); }
+      catch (e) { lastSyncError_ = 'Jaringan terputus saat sinkronisasi.'; break; }
+      if (!res || res.ok !== true) {
+        if (res && res.code === 'AUTH') { needRelogin_ = true; lastSyncError_ = 'Sesi berakhir, silakan masuk lagi untuk melanjutkan sinkronisasi.'; break; }
+        lastSyncError_ = (res && res.error) || 'Sinkronisasi ditolak server.';
+        OFF.state.outbox.shift(); touchOutbox_(); continue; // buang entri yang ditolak agar tidak mengganjal selamanya
+      }
+      if (entry.mode === 'create' && entry.localId != null) {
+        reconcileCreated_(entry, res.data);
+      }
+      OFF.state.outbox.shift(); touchOutbox_();
+    }
+    if (!OFF.state.outbox.length) { lastSyncError_ = null; await pullFromServer(); }
+  } finally { syncing_ = false; updateSyncBadge(); }
+}
+function reconcileCreated_(entry, serverData) {
+  if (!serverData || typeof serverData.id !== 'number') { return; }
+  var oldId = entry.localId, newId = serverData.id, table = entry.table;
+  if (entry.action === 'checkout') {
+    OFF.db.removeWhere('Transactions', function (r) { return r.id === oldId; });
+    OFF.db.removeWhere('TxItems', function (r) { return r.tx_id === oldId; });
+    OFF.db.insertRaw('Transactions', {
+      id: newId, invoice_no: serverData.invoice_no, date: serverData.date, user_id: serverData.user_id, user_name: serverData.cashier,
+      customer_id: serverData.customer_id, customer_name: serverData.customer, customer_addr: serverData.customer_addr,
+      subtotal: serverData.subtotal, discount_type: serverData.discount_type, discount_value: serverData.discount_value, discount_amount: serverData.discount_amount,
+      tax_rate: serverData.tax_rate, tax_amount: serverData.tax_amount, grand_total: serverData.grand_total, method: serverData.method,
+      amount_paid: serverData.amount_paid, change: serverData.change, status: serverData.status, note: serverData.note
+    });
+    (serverData.items || []).forEach(function (it) {
+      OFF.db.insert('TxItems', { tx_id: newId, invoice_no: serverData.invoice_no, date: serverData.date, user_id: serverData.user_id, product_id: it.product_id, name: it.name, type: it.type, qty: it.qty, price: it.price, cost: 0, subtotal: it.subtotal });
+    });
+  } else {
+    OFF.db.replaceRow(table, oldId, serverData);
+  }
+  OFF.state.outbox.forEach(function (o) { if (o !== entry) { rewriteRefs_(o.payload, o.action, table, oldId, newId); } });
+}
+
+/* ---------- ambil data terbaru dari server ---------- */
+async function pullFromServer() {
+  if (!offlineReady || !navigator.onLine || !getWebAppUrl() || !S.token) { return; }
+  var res;
+  try { res = await serverCall('syncPull', S.token, { days: 180 }, 25000); }
+  catch (e) { return; }
+  if (!res || res.ok !== true) { if (res && res.code === 'AUTH') { needRelogin_ = true; } return; }
+  var d = res.data;
+  OFF.db.replaceAll('Users', d.users);
+  OFF.db.replaceAll('Categories', d.categories);
+  OFF.db.replaceAll('Products', d.products);
+  OFF.db.replaceAll('Customers', d.customers);
+  OFF.db.replaceAll('Services', d.services);
+  if (d.evaluations) { OFF.db.replaceAll('Evaluations', d.evaluations); }
+  OFF.db.mergeWindow('Transactions', d.transactions);
+  var txIds = (d.transactions || []).map(function (t) { return t.id; });
+  OFF.db.mergeWindow('TxItems', d.tx_items, 'tx_id', txIds);
+  if (d.kv) { OFF.state.kv = Object.assign({}, OFF.state.kv, d.kv); scheduleSave_(); }
+  lastPullAt_ = Date.now(); lastSyncError_ = null; needRelogin_ = false;
+  scheduleSave_();
+  if (typeof onOfflineDataChanged === 'function') { onOfflineDataChanged(); }
+}
+
+/* ---------- token ganda ----------
+   S.token  : token yang DIKIRIM ke server (ditandatangani oleh secret SERVER). Dipakai
+              hanya untuk serverCall()/fetch ke Web App.
+   OFF.state.localToken : token yang ditandatangani oleh secret PERANGKAT ini sendiri
+              (dibuat oleh initOffline()). Dipakai untuk SEMUA panggilan ke OFF.backend
+              (baca/tulis lokal), baik saat online maupun offline -- karena backend lokal
+              memverifikasi tanda tangan memakai secret lokal, bukan secret server, token
+              server TIDAK akan pernah valid di sana. Kedua token disegarkan setiap login
+              (online maupun offline); tersimpan sendiri-sendiri sehingga tetap konsisten
+              walau salah satu kedaluwarsa lebih dulu. */
+function localToken_() { return (OFF && OFF.state && OFF.state.localToken) || ''; }
+
+/** Login: coba server dulu (kalau online & alamat sudah diatur); apa pun hasilnya, jaga
+ *  agar ada juga sesi lokal yang valid supaya kasir/service/dst tetap bisa dipakai offline. */
+async function handleLogin_(payload) {
+  var r = null;
+  if (navigator.onLine && getWebAppUrl()) {
+    try { r = await serverCall('login', '', payload, 15000); } catch (netErr) { r = null; }
+  }
+  if (r) {
+    if (r.ok) {
+      // set S.token SEKARANG (bukan menunggu pemanggil) supaya pullFromServer() di bawah,
+      // yang berjalan di latar belakang, punya token server yang valid untuk dipakai.
+      S.token = r.data.token;
+      try {
+        var lr = OFF.backend.handle('login', '', payload);
+        if (lr.ok) { OFF.state.localToken = lr.data.token; scheduleSave_(); }
+      } catch (e) {}
+      // tarik data terbaru di latar belakang; kalau tadi login lokal gagal (mis. perangkat
+      // ini belum pernah menyimpan data user ini), coba lagi sesudah data tersedia.
+      pullFromServer().then(function () {
+        if (!localToken_()) {
+          try { var lr2 = OFF.backend.handle('login', '', payload); if (lr2.ok) { OFF.state.localToken = lr2.data.token; scheduleSave_(); } } catch (e) {}
+        }
+        updateSyncBadge();
+      }).catch(function () {});
+      return r.data;
+    }
+    var eServer = new Error(r.error || 'Terjadi kesalahan.'); eServer.code = r.code; throw eServer;
+  }
+  // offline, atau server tidak terjangkau: masuk memakai data yang tersimpan di perangkat.
+  var lr3 = OFF.backend.handle('login', '', payload);
+  if (!lr3.ok) {
+    var eLocal = new Error(lr3.error || 'Tidak dapat masuk. Sambungkan ke internet minimal sekali untuk login pertama kali.'); eLocal.code = lr3.code; throw eLocal;
+  }
+  OFF.state.localToken = lr3.data.token; scheduleSave_();
+  return lr3.data; // token di sini bertanda tangan lokal; dipakai sementara sbg S.token juga (lihat catatan di atas)
+}
+
+/* ---------- lencana status sinkronisasi (dipakai di topbar) ---------- */
+function updateSyncBadge() {
+  var el = document.getElementById('syncPill'); if (!el) { return; }
+  var n = (OFF && OFF.state && OFF.state.outbox) ? OFF.state.outbox.length : 0;
+  var cls = 'sync-pill', label;
+  if (!navigator.onLine) { cls += ' is-offline'; label = 'Offline' + (n ? ' · ' + n + ' antre' : ''); }
+  else if (needRelogin_) { cls += ' is-error'; label = 'Perlu masuk ulang'; }
+  else if (syncing_) { cls += ' is-pending'; label = 'Menyinkronkan…'; }
+  else if (n > 0) { cls += ' is-pending'; label = n + ' menunggu sinkron'; }
+  else if (lastSyncError_) { cls += ' is-error'; label = 'Sinkron gagal'; }
+  else { cls += ' is-online'; label = 'Tersinkron'; }
+  el.className = cls; el.title = lastSyncError_ || (needRelogin_ ? 'Masuk lagi saat online untuk melanjutkan sinkronisasi.' : 'Klik untuk sinkron sekarang');
+  el.innerHTML = '<span class="dot"></span>' + label;
+}
+
+/* ---------- transport dipakai oleh app.js (menggantikan google.script.run) ---------- */
+async function api(action, payload) {
+  progress(1);
+  try {
+    if (!offlineReady) { await initOffline(); }
+    if (action === 'login') { return await handleLogin_(payload || {}); }
+    var isWrite = !!WRITE_ACTIONS[action];
+
+    if (isWrite) {
+      var local = OFF.backend.handle(action, localToken_(), payload || {});
+      if (!local.ok) {
+        var e1 = new Error(local.error || 'Terjadi kesalahan.'); e1.code = local.code;
+        if (local.code === 'AUTH') { authLost(local.error); }
+        throw e1;
+      }
+      afterLocalWrite_(action, payload || {}, local.data);
+      if (navigator.onLine) { flushOutbox().catch(function () {}); }
+      return local.data;
+    }
+
+    // baca: kalau online, coba server dulu (data paling baru); kalau gagal karena apa pun
+    // (offline, jaringan, atau token server tidak valid), pakai data lokal -- jangan
+    // langsung mengeluarkan pengguna hanya karena server menolak, selama sesi lokal masih sah.
+    if (navigator.onLine && getWebAppUrl() && S.token) {
+      try {
+        var r = await serverCall(action, S.token, payload, 15000);
+        if (r && r.ok) { return r.data; }
+      } catch (netErr) {}
+    }
+    var localR = OFF.backend.handle(action, localToken_(), payload || {});
+    if (!localR.ok) {
+      var e3 = new Error(localR.error || 'Terjadi kesalahan.'); e3.code = localR.code;
+      if (localR.code === 'AUTH') { authLost(localR.error); }
+      throw e3;
+    }
+    return localR.data;
+  } finally { progress(-1); }
+}
+
+</script>
 
 <script>
 'use strict';
@@ -435,40 +1647,17 @@ const S = {
   paper: Number(store.get('hdt_paper')) === 58 ? 58 : 80,
   sel: { products: new Set(), customers: new Set(), users: new Set() }
 };
-const IS_GAS = typeof google !== 'undefined' && google.script && google.script.run;
-const IS_DEMO = !IS_GAS && !!window.HDT_DEMO;
-
 /* ---------- transport ---------- */
+// api() dan seluruh mesin offline (IndexedDB + antrean sinkronisasi) didefinisikan di
+// blok <script> sebelum ini (lihat engine.js yang ditempel di atas). Di PWA ini TIDAK ada
+// mode "GAS" (google.script.run) atau "mode demo" -- selalu lewat mesin offline yang
+// membaca/menulis lokal lalu menyinkronkan ke Web App Google Apps Script saat online.
 let pending = 0;
 function progress(d) {
   pending = Math.max(0, pending + d);
   const b = $('#bar'); if (!b) return;
   if (pending > 0) { b.classList.remove('done'); b.classList.add('on'); }
   else { b.classList.remove('on'); b.classList.add('done'); setTimeout(() => { if (!pending) b.classList.remove('done'); }, 500); }
-}
-function rawCall(action, payload) {
-  if (IS_GAS) {
-    return new Promise((resolve, reject) => {
-      google.script.run
-        .withSuccessHandler(r => { try { resolve(JSON.parse(r)); } catch (e) { reject(new Error('Respons server tidak valid.')); } })
-        .withFailureHandler(e => reject(new Error((e && e.message) || 'Tidak dapat terhubung ke server. Periksa koneksi internet.')))
-        .apiCall(action, S.token || '', JSON.stringify(payload || {}));
-    });
-  }
-  if (!IS_DEMO) { return Promise.reject(new Error('Backend tidak ditemukan.')); }
-  return new Promise(res => setTimeout(() => res(JSON.parse(JSON.stringify(window.HDT_DEMO.handle(action, S.token || '', payload || {})))), 90));
-}
-async function api(action, payload) {
-  progress(1);
-  try {
-    const r = await rawCall(action, payload);
-    if (!r.ok) {
-      const e = new Error(r.error || 'Terjadi kesalahan.'); e.code = r.code;
-      if (r.code === 'AUTH') { authLost(r.error); }
-      throw e;
-    }
-    return r.data;
-  } finally { progress(-1); }
 }
 /** Jalankan aksi dengan tombol terkunci + tampilkan error sebagai toast. */
 async function run(btn, fn) {
@@ -932,7 +2121,10 @@ function showLogin(msg) {
     '<label class="field"><span>Username</span><input id="lu" type="text" autocomplete="username" autocapitalize="none" spellcheck="false"></label>' +
     '<label class="field"><span>Password</span><input id="lp" type="password" autocomplete="current-password"></label>' +
     '<button type="button" class="btn btn-primary" id="lgo" style="width:100%;min-height:46px">Masuk</button>' +
-    (IS_DEMO ? '<div class="hint">Akun demo — klik untuk mengisi:<br><button type="button" data-u="admin" data-p="admin123">Kasir Admin · admin</button><button type="button" data-u="sari" data-p="kasir123">Kasir · sari</button><button type="button" data-u="budi" data-p="kasir123">Kasir · budi</button></div>' : '') + '</div>';
+    '<div class="hint" id="loffline" hidden>Tidak ada internet — masuk memakai data yang tersimpan di perangkat ini (hasil sinkronisasi terakhir).</div>' +
+    '<button type="button" class="btn btn-sm" id="lsrv" style="margin-top:10px;width:100%">Alamat server…</button></div>';
+  $('#loffline').hidden = navigator.onLine;
+  $('#lsrv').onclick = () => webAppUrlPrompt();
   api('publicInfo').then(i => {
     const lb = $('#lb'); if (!lb) { return; }
     const draw = logo => { const b = $('#lb'); if (b) { b.innerHTML = (logo ? '<img src="' + esc(logo) + '" alt="Logo">' : '') + '<div><h1>' + esc(i.store_name) + '</h1><p>Masuk untuk memulai</p></div>'; } };
@@ -952,7 +2144,6 @@ function showLogin(msg) {
   };
   $('#lgo').onclick = go;
   $('#login').onkeydown = e => { if (e.key === 'Enter') { go(); } };
-  $$('.hint button').forEach(b => b.onclick = () => { $('#lu').value = b.dataset.u; $('#lp').value = b.dataset.p; $('#lgo').focus(); });
   $('#lu').focus();
 }
 let authBusy = false;
@@ -970,12 +2161,13 @@ function renderShell() {
   $('#login').hidden = true; $('#login').innerHTML = ''; $('#app').hidden = false;
   const u = S.user;
   $('#app').innerHTML = '<header class="topbar"><button type="button" class="burger" data-act="toggleNav" aria-label="Buka atau tutup menu" aria-controls="side" aria-expanded="false">' + icon('menu') + '</button>' + brandHtml() + '<span class="grow"></span>' +
+    '<button type="button" class="sync-pill" id="syncPill" data-act="syncNow"></button>' +
     '<div class="who"><button type="button" class="who-btn" data-act="menu" aria-haspopup="menu" aria-expanded="false"><span class="ava">' + esc((u.full_name || '?')[0].toUpperCase()) + '</span><span class="w"><b>' + esc(u.full_name) + '</b><small>' + ROLE[u.role] + '</small></span><span aria-hidden="true">▾</span></button>' +
     '<div class="menu" id="menu" role="menu" hidden><button type="button" role="menuitem" data-act="pwd">Ganti password</button><button type="button" role="menuitem" data-act="theme">Ganti tema</button>' +
-    (IS_DEMO ? '<button type="button" role="menuitem" data-act="demoReset">Reset data demo</button>' : '') + '<hr><button type="button" role="menuitem" data-act="logout">Keluar</button></div></div></header>' +
+    '<button type="button" role="menuitem" data-act="serverUrl">Alamat server</button><hr><button type="button" role="menuitem" data-act="logout">Keluar</button></div></div></header>' +
     '<div id="banner"></div><div class="shell" id="shell" data-nav="closed"><aside class="side" id="side" aria-label="Menu utama"><div class="side-head"><b>Menu</b><button type="button" class="side-x" data-act="closeNav" aria-label="Tutup menu">' + icon('close', 20) + '</button></div><nav id="nav"></nav></aside><div class="scrim" data-act="closeNav"></div><main id="view" tabindex="-1"></main></div>' +
     '<nav id="bnav" class="bnav" aria-label="Navigasi utama"></nav>';
-  renderBanner(); S.navOverlay = false; applyNav(); renderBottomNav();
+  renderBanner(); S.navOverlay = false; applyNav(); renderBottomNav(); updateSyncBadge();
 }
 function renderBanner() {
   const b = $('#banner'); if (!b) { return; }
@@ -1057,10 +2249,20 @@ Object.assign(ACT, {
   menu(t) { const m = $('#menu'); m.hidden = !m.hidden; t.setAttribute('aria-expanded', String(!m.hidden)); },
   pwd() { const m = $('#menu'); if (m) { m.hidden = true; } changePassword(); },
   theme() { $('#menu').hidden = true; cycleTheme(); },
-  logout() { $('#menu').hidden = true; confirmBox({ title: 'Keluar?', message: S.cart.length ? 'Keranjang yang belum dibayar akan hilang.' : 'Anda akan keluar dari aplikasi.', ok: 'Keluar' }).then(y => { if (y) { store.del('hdt_tok'); showLogin(); } }); },
-  demoReset() {
+  logout() {
     $('#menu').hidden = true;
-    confirmBox({ title: 'Reset data demo?', message: 'Semua perubahan pada demo ini akan dihapus dan data contoh dibuat ulang.', ok: 'Reset', danger: true }).then(y => { if (y) { window.HDT_DEMO.reset(); showLogin('Data demo dikembalikan ke awal. Silakan masuk.'); } });
+    confirmBox({ title: 'Keluar?', message: S.cart.length ? 'Keranjang yang belum dibayar akan hilang.' : 'Anda akan keluar dari aplikasi.', ok: 'Keluar' }).then(y => {
+      if (!y) { return; }
+      store.del('hdt_tok');
+      if (typeof OFF !== 'undefined' && OFF && OFF.state) { OFF.state.localToken = null; scheduleSave_(); }
+      showLogin();
+    });
+  },
+  serverUrl() { $('#menu').hidden = true; webAppUrlPrompt(); },
+  syncNow() {
+    if (!navigator.onLine) { toast('Tidak ada internet saat ini.', 'err'); return; }
+    if (!getWebAppUrl()) { webAppUrlPrompt(); return; }
+    flushOutbox().then(() => { updateSyncBadge(); if (typeof onOfflineDataChanged === 'function') { onOfflineDataChanged(); } });
   }
 });
 
@@ -1070,13 +2272,42 @@ document.addEventListener('keydown', e => {
   else if (e.key === 'F9') { e.preventDefault(); openPay(); }
 });
 
+function webAppUrlPrompt(onSaved) {
+  const m = openModal({
+    title: 'Alamat Server (Web App URL)', focus: '#wau',
+    body: '<p class="hint" style="margin:0 0 10px">Tempel URL Web App Apps Script ("/exec") ATAU URL Supabase Edge Function Anda. Aplikasi ini akan memakainya untuk sinkronisasi data saat internet tersedia; tanpa internet, aplikasi tetap bisa dipakai memakai data terakhir yang tersimpan di perangkat.</p>' +
+      '<label class="field"><span>URL Web App / Edge Function</span><input id="wau" type="url" placeholder="https://xxxx.supabase.co/functions/v1/api" value="' + esc(getWebAppUrl()) + '"></label>' +
+      '<div class="form-error" id="waerr" hidden></div>',
+    foot: '<button type="button" class="btn" data-close2>Batal</button><button type="button" class="btn btn-primary" id="wasave">Simpan</button>'
+  });
+  m.$('[data-close2]').onclick = () => m.close();
+  const save = () => {
+    const v = m.$('#wau').value.trim();
+    if (v && !/^https:\/\//.test(v)) {
+      const err = m.$('#waerr'); err.textContent = 'URL harus diawali https://'; err.hidden = false; return;
+    }
+    setWebAppUrl(v); m.close(); updateSyncBadge(); toast('Alamat server disimpan.', 'ok');
+    if (onSaved) { onSaved(v); }
+  };
+  m.$('#wasave').onclick = save;
+  m.el.addEventListener('keydown', e => { if (e.key === 'Enter') { save(); } });
+}
+
 async function boot() {
   applyTheme();
-  if (IS_DEMO) { $('#demoNote').hidden = false; }
+  await initOffline();
+  if (!getWebAppUrl()) {
+    $('#setupGate').hidden = false;
+    $('#setupGate').innerHTML = '<div class="setup-card"><h1>Pengaturan awal</h1><p>Sebelum dipakai pertama kali, hubungkan aplikasi ini ke Web App HDT POS (Google Apps Script) Anda. Setelah tersambung sekali, aplikasi bisa dipakai offline dan akan sinkron otomatis saat online.</p><button type="button" class="btn btn-primary" id="gostp" style="width:100%;min-height:46px">Atur alamat server</button></div>';
+    $('#gostp').onclick = () => webAppUrlPrompt(v => { if (v) { $('#setupGate').hidden = true; $('#setupGate').innerHTML = ''; boot(); } });
+    return;
+  }
   const tok = store.get('hdt_tok');
   if (tok) { S.token = tok; try { await enter(); return; } catch (e) { S.token = null; } }
   showLogin();
 }
+window.addEventListener('online', () => { updateSyncBadge(); flushOutbox().then(() => { if (typeof onOfflineDataChanged === 'function') { onOfflineDataChanged(); } }).catch(() => {}); });
+window.addEventListener('offline', () => { updateSyncBadge(); });
 
 /* =====================================================================
    KASIR
@@ -1837,7 +3068,7 @@ function viewPengaturan() {
       '<label class="field"><span>Teks kaki struk</span><input id="sFoot" type="text" maxlength="250" value="' + esc(s.receipt_footer) + '"></label>' +
       '<label class="check" style="display:flex;margin-bottom:10px"><input type="checkbox" id="sLogoRc"' + (s.show_logo_on_receipt ? ' checked' : '') + '> Tampilkan logo di struk</label>' +
       '<label class="check" style="display:flex"><input type="checkbox" id="sAuto"' + (s.auto_print ? ' checked' : '') + '> Cetak struk otomatis setelah bayar (transaksi tanpa invoice)</label></div></div>' +
-    '<p class="page-note">' + (IS_GAS ? 'Data usaha tersimpan di Google Sheets <b>“HDT POS Database”</b> pada Google Drive pemilik script.' : 'Mode demo: data hanya tersimpan di browser ini.') + '</p></div></div>';
+    '<p class="page-note">Data usaha tersimpan di server (Google Sheets atau Supabase, tergantung alamat server yang diatur), dan dicadangkan di perangkat ini supaya tetap bisa dipakai tanpa internet. Alamat server: <code>' + esc(getWebAppUrl() || '(belum diatur)') + '</code></p></div></div>';
   $('#sPaper').value = String(s.paper_width);
   drawLogo(); drawQris(); invPreview();
 }
@@ -2038,6 +3269,13 @@ Object.assign(VIEWS, {
 
 boot();
 
+</script>
+<script>
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
+  });
+}
 </script>
 </body>
 </html>
