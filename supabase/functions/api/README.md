@@ -7,17 +7,37 @@ jadi frontend (PWA maupun demo browser) tidak perlu tahu bedanya.
 
 ## Isi folder
 
-- `Core.gs` — salinan PERSIS (byte-for-byte) dari `hdtpos-gas/Core.gs`.
-  Jangan diedit di sini. Kalau ada perubahan logika bisnis di GAS,
-  salin ulang file ini (timpa) lalu deploy ulang. Jangan menambahkan
-  `export` atau baris lain ke file ini — lihat `core-loader.js`.
-- `core-loader.js` — membaca `Core.gs` sebagai teks lalu menjalankannya,
-  supaya file itu tidak perlu diubah sama sekali untuk jalan di Deno.
+- `Core.gs` — salinan PERSIS (byte-for-byte) dari `hdtpos-gas/Core.gs`,
+  disimpan di sini hanya sebagai REFERENSI/untuk diffing. Jangan diedit
+  di sini, dan **tidak dipakai langsung saat deploy** (lihat catatan
+  `core-src.js` di bawah). Kalau ada perubahan logika bisnis di GAS,
+  salin ulang file ini (timpa), lalu jalankan `generate-core-src.py`
+  (lihat di bawah) sebelum deploy ulang.
+- `core-src.js` — **inilah yang benar-benar dipakai saat runtime**: isi
+  `Core.gs` disematkan di sini sebagai teks base64 di dalam modul JS.
+  Ini WAJIB (bukan gaya penulisan saja) — `supabase functions deploy`
+  membundel function berdasarkan import graph, jadi file yang cuma
+  dibaca lewat `Deno.readTextFile('./Core.gs')` saat runtime TIDAK ikut
+  terbawa ke server produksi (walau jalan normal saat `supabase
+  functions serve` lokal, karena lokal masih baca dari disk asli) —
+  menyebabkan error `path not found: .../Core.gs`. Kalau `Core.gs`
+  diperbarui, generate ulang file ini dengan:
+  ```
+  python3 supabase/functions/api/generate-core-src.py
+  ```
+- `generate-core-src.py` — skrip generator `core-src.js` di atas.
+- `core-loader.js` — mengambil isi `Core.gs` dari `core-src.js` lalu
+  menjalankannya, supaya `Core.gs` tidak perlu diubah sama sekali
+  (tidak ada `export` ditambahkan) untuk jalan di Deno.
 - `platform.js` — adaptor Postgres yang mengisi objek `P` yang dibutuhkan
   `createBackend_(P)` di Core.gs (db, sha256, now, lock, secret, cache, log).
 - `index.ts` — titik masuk HTTP (`Deno.serve`). Alur tiap request:
   kunci → ambil semua tabel → jalankan Core.gs di memori → simpan balik →
   lepas kunci.
+
+**Penting:** setiap kali `Core.gs` diperbarui, jalankan
+`generate-core-src.py` SEBELUM `supabase functions deploy` — kalau
+lupa, Edge Function akan tetap menjalankan versi `Core.gs` yang lama.
 
 ## Menjalankan & mencoba secara lokal
 
