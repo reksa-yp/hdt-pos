@@ -1401,6 +1401,7 @@ var syncing_ = false;
 var needRelogin_ = false;
 var lastSyncError_ = null;
 var lastPullAt_ = 0;
+var lastReadFallback_ = null;    // { action, error } bila baca terakhir terpaksa memakai data perangkat
 
 function scheduleSave_() {
   if (saveTimer_) { return; }
@@ -1493,6 +1494,25 @@ function cancelPendingCreate_(table, localId) {
   if (i >= 0) { OFF.state.outbox.splice(i, 1); }
 }
 function touchOutbox_() { scheduleSave_(); updateSyncBadge(); }
+/** Penawaran yang tersimpan di perangkat (id negatif) tapi tidak ada lagi di antrean -- misalnya
+ *  dulu ditolak server yang belum diperbarui -- dimasukkan lagi ke antrean supaya tetap terkirim. */
+function requeueOrphanQuotes_() {
+  (OFF.state.tables.Quotes || []).forEach(function (r) {
+    if (r.id >= 0 || findPendingCreate_('Quotes', r.id)) { return; }
+    var items = [];
+    try { items = JSON.parse(r.items || '[]'); } catch (e) { items = []; }
+    OFF.state.outbox.push({
+      id: uid_(), action: 'quoteSave', table: 'Quotes', mode: 'create', localId: r.id, ts: new Date().toISOString(),
+      payload: {
+        id: 0, customer_name: r.customer_name, customer_phone: r.customer_phone, customer_addr: r.customer_addr,
+        date: r.date, valid_days: r.valid_days,
+        items: (Array.isArray(items) ? items : []).map(function (l) { return { name: l.name, qty: l.qty, price: l.price }; }),
+        discount_type: r.discount_type || 'none', discount_value: r.discount_value, tax_rate: r.tax_rate, note: r.note
+      }
+    });
+  });
+  touchOutbox_();
+}
 
 /** Dipanggil setelah aksi tulis berhasil dijalankan secara LOKAL, untuk menentukan
  *  apakah & bagaimana perubahan ini perlu diantre menunggu koneksi internet. */
@@ -1531,22 +1551,33 @@ async function flushOutbox() {
   if (syncing_ || !offlineReady) { return; }
   if (!navigator.onLine || !getWebAppUrl() || !S.token) { return; }
   syncing_ = true; updateSyncBadge();
+  requeueOrphanQuotes_();
+  var deferred = [], failed = false;
   try {
     while (OFF.state.outbox.length) {
       var entry = OFF.state.outbox[0], res;
       try { res = await serverCall(entry.action, S.token, entry.payload, 15000); }
-      catch (e) { lastSyncError_ = 'Jaringan terputus saat sinkronisasi.'; break; }
+      catch (e) { lastSyncError_ = 'Jaringan terputus saat sinkronisasi.'; failed = true; break; }
       if (!res || res.ok !== true) {
-        if (res && res.code === 'AUTH') { needRelogin_ = true; lastSyncError_ = 'Sesi berakhir, silakan masuk lagi untuk melanjutkan sinkronisasi.'; break; }
+        if (res && res.code === 'AUTH') { needRelogin_ = true; lastSyncError_ = 'Sesi berakhir, silakan masuk lagi untuk melanjutkan sinkronisasi.'; failed = true; break; }
         lastSyncError_ = (res && res.error) || 'Sinkronisasi ditolak server.';
-        OFF.state.outbox.shift(); touchOutbox_(); continue; // buang entri yang ditolak agar tidak mengganjal selamanya
+        OFF.state.outbox.shift();
+        // Masalah di sisi server (versi server lama / "Aksi tidak dikenal", atau error database):
+        // data ini sah, jadi JANGAN dibuang -- simpan untuk dicoba lagi nanti. Hanya entri yang
+        // ditolak karena isinya tidak valid yang dibuang supaya tidak mengganjal selamanya.
+        if (!res || res.code === 'NOACTION' || res.code === 'SERVER') { deferred.push(entry); }
+        touchOutbox_(); continue;
       }
       if (entry.mode === 'create' && entry.localId != null) {
         reconcileCreated_(entry, res.data);
       }
       OFF.state.outbox.shift(); touchOutbox_();
     }
-    if (!OFF.state.outbox.length) { lastSyncError_ = null; await pullFromServer(); }
+    if (deferred.length) { OFF.state.outbox = OFF.state.outbox.concat(deferred); touchOutbox_(); }
+    // tarik data server bila antrean kosong, atau yang tersisa hanya penawaran (tarikan data
+    // penawaran selalu mempertahankan penawaran lokal yang belum tersinkron)
+    var onlyQuotesLeft = OFF.state.outbox.every(function (e) { return e.table === 'Quotes'; });
+    if (!failed && onlyQuotesLeft) { if (!deferred.length) { lastSyncError_ = null; } await pullFromServer(!!deferred.length); }
   } finally { syncing_ = false; updateSyncBadge(); }
 }
 function reconcileCreated_(entry, serverData) {
@@ -1576,7 +1607,7 @@ function reconcileCreated_(entry, serverData) {
 }
 
 /* ---------- ambil data terbaru dari server ---------- */
-async function pullFromServer() {
+async function pullFromServer(keepError) {
   if (!offlineReady || !navigator.onLine || !getWebAppUrl() || !S.token) { return; }
   var res;
   try { res = await serverCall('syncPull', S.token, { days: 180 }, 25000); }
@@ -1597,7 +1628,7 @@ async function pullFromServer() {
   var txIds = (d.transactions || []).map(function (t) { return t.id; });
   OFF.db.mergeWindow('TxItems', d.tx_items, 'tx_id', txIds);
   if (d.kv) { OFF.state.kv = Object.assign({}, OFF.state.kv, d.kv); scheduleSave_(); }
-  lastPullAt_ = Date.now(); lastSyncError_ = null; needRelogin_ = false;
+  lastPullAt_ = Date.now(); if (!keepError) { lastSyncError_ = null; } needRelogin_ = false;
   scheduleSave_();
   if (typeof onOfflineDataChanged === 'function') { onOfflineDataChanged(); }
 }
@@ -1660,9 +1691,9 @@ function updateSyncBadge() {
   else if (needRelogin_) { cls += ' is-error'; label = 'Perlu masuk ulang'; }
   else if (syncing_) { cls += ' is-pending'; label = 'Menyinkronkan…'; }
   else if (n > 0) { cls += ' is-pending'; label = n + ' menunggu sinkron'; }
-  else if (lastSyncError_) { cls += ' is-error'; label = 'Sinkron gagal'; }
+  else if (lastSyncError_ || lastReadFallback_) { cls += ' is-error'; label = 'Sinkron gagal'; }
   else { cls += ' is-online'; label = 'Tersinkron'; }
-  el.className = cls; el.title = lastSyncError_ || (needRelogin_ ? 'Masuk lagi saat online untuk melanjutkan sinkronisasi.' : 'Klik untuk sinkron sekarang');
+  el.className = cls; el.title = lastSyncError_ || (lastReadFallback_ ? 'Server menolak: ' + lastReadFallback_.error : '') || (needRelogin_ ? 'Masuk lagi saat online untuk melanjutkan sinkronisasi.' : 'Klik untuk sinkron sekarang');
   el.innerHTML = '<span class="dot"></span>' + label;
 }
 
@@ -1690,10 +1721,16 @@ async function api(action, payload) {
     // (offline, jaringan, atau token server tidak valid), pakai data lokal -- jangan
     // langsung mengeluarkan pengguna hanya karena server menolak, selama sesi lokal masih sah.
     if (navigator.onLine && getWebAppUrl() && S.token) {
+      var why = null;
       try {
         var r = await serverCall(action, S.token, payload, 15000);
-        if (r && r.ok) { return r.data; }
-      } catch (netErr) {}
+        if (r && r.ok) { if (lastReadFallback_ || needRelogin_) { lastReadFallback_ = null; needRelogin_ = false; updateSyncBadge(); } return withLocalPending_(action, payload, r.data); }
+        if (r && r.code === 'AUTH') { needRelogin_ = true; why = 'Sesi login tidak dikenali server. Keluar lalu masuk lagi.'; }
+        else { why = (r && r.error) || 'Server tidak merespons dengan benar.'; }
+      } catch (netErr) { why = 'Server tidak dapat dihubungi.'; }
+      // tetap pakai data perangkat supaya aplikasi bisa dipakai, tapi JANGAN diam-diam:
+      // catat alasannya supaya tampil di lencana sinkron (dan di daftar penawaran).
+      lastReadFallback_ = { action: action, error: why }; updateSyncBadge();
     }
     var localR = OFF.backend.handle(action, localToken_(), payload || {});
     if (!localR.ok) {
@@ -1703,6 +1740,16 @@ async function api(action, payload) {
     }
     return localR.data;
   } finally { progress(-1); }
+}
+/** Daftar penawaran dari server belum memuat penawaran yang baru dibuat di perangkat ini & masih antre. */
+function withLocalPending_(action, payload, data) {
+  if (action !== 'quoteList' || !data || !Array.isArray(data.rows)) { return data; }
+  var loc = OFF.backend.handle('quoteList', localToken_(), payload || {});
+  if (loc.ok) {
+    var pend = loc.data.rows.filter(function (r) { return r.id < 0; });
+    if (pend.length) { data.rows = pend.concat(data.rows); data.total += pend.length; }
+  }
+  return data;
 }
 
 </script>
@@ -2053,6 +2100,7 @@ async function saveQuote(silent) {
   return true;
 }
 /** Dipanggil mesin offline setelah penawaran yang dibuat offline mendapat id & nomor asli dari server. */
+function onOfflineDataChanged() { if (S.view === 'penawaran' && S.quoteTab === 'list') { loadQuotes(); } }
 function onQuoteSynced(oldId, d) {
   if (S.quote && S.quote.id === oldId) { S.quote.id = d.id; S.quote.no = d.quote_no; renderQuoteStatus(); }
   if (S.view === 'penawaran' && S.quoteTab === 'list') { loadQuotes(); }
@@ -2225,7 +2273,9 @@ async function loadQuotes() {
 function drawQuotes(r) {
   const el = $('#qList'); if (!el) { return; }
   const admin = S.user.role === 'admin', today = r.today || ymdNow();
-  el.innerHTML = r.rows.length ? '<div class="tscroll"><table class="t"><thead><tr><th>No. penawaran</th><th class="hide-sm">Tanggal</th><th>Pelanggan</th><th class="hide-sm">Berlaku hingga</th><th class="num">Total</th><th></th></tr></thead><tbody>' +
+  const fb = (typeof lastReadFallback_ !== 'undefined' && lastReadFallback_ && lastReadFallback_.action === 'quoteList') ? lastReadFallback_ : null;
+  const note = fb ? '<div role="status" style="margin:12px 16px 0;padding:10px 12px;border-radius:10px;background:var(--warn-bg);color:var(--warn);font-size:14px"><b>Data server tidak bisa dibaca</b> — ' + esc(fb.error) + ' Daftar di bawah hanya berisi penawaran yang tersimpan di perangkat ini; penawaran dari perangkat lain belum tampil.</div>' : '';
+  el.innerHTML = note + (r.rows.length ? '<div class="tscroll"><table class="t"><thead><tr><th>No. penawaran</th><th class="hide-sm">Tanggal</th><th>Pelanggan</th><th class="hide-sm">Berlaku hingga</th><th class="num">Total</th><th></th></tr></thead><tbody>' +
     r.rows.map(x => {
       const expired = x.valid_until && x.valid_until < today, mine = admin || x.user_id === S.user.id;
       return '<tr><td><b>' + esc(x.quote_no) + '</b>' + (x.id < 0 ? ' <span class="badge warn" title="Tersimpan di perangkat, menunggu sinkron ke server">Antre</span>' : '') +
@@ -2239,7 +2289,7 @@ function drawQuotes(r) {
         (mine ? ' <button type="button" class="btn btn-sm btn-ghost" data-act="quoteDel" data-id="' + x.id + '" data-no="' + esc(x.quote_no) + '" aria-label="Hapus ' + esc(x.quote_no) + '" title="Hapus">✕</button>' : '') + '</td></tr>';
     }).join('') +
     '</tbody><tfoot><tr><td colspan="6">' + r.total + ' penawaran' + (r.total > r.rows.length ? ' (menampilkan ' + r.rows.length + ' terbaru — gunakan pencarian)' : '') + '</td></tr></tfoot></table></div>'
-    : '<div class="empty"><strong>' + (S.quoteQ ? 'Penawaran tidak ditemukan' : 'Belum ada penawaran tersimpan') + '</strong>' + (S.quoteQ ? 'Coba kata kunci lain.' : 'Penawaran tersimpan otomatis saat Anda menekan Simpan atau Simpan &amp; Cetak.') + '</div>';
+    : '<div class="empty"><strong>' + (S.quoteQ ? 'Penawaran tidak ditemukan' : 'Belum ada penawaran tersimpan') + '</strong>' + (S.quoteQ ? 'Coba kata kunci lain.' : 'Penawaran tersimpan otomatis saat Anda menekan Simpan atau Simpan &amp; Cetak.') + '</div>');
 }
 function leaveQuoteOk() {
   const q = S.quote;
@@ -2349,6 +2399,7 @@ async function enter() {
   S.cart = []; S.customerId = 0; S.discValue = 0; S.cat = 'all'; S.q = ''; S.qrisImg = null;
   Object.keys(S.sel).forEach(k => S.sel[k].clear());
   renderShell(); go(S.user.role === 'admin' ? 'dashboard' : 'kasir');
+  if (navigator.onLine) { flushOutbox().then(() => { updateSyncBadge(); onOfflineDataChanged(); }).catch(() => {}); }
 }
 
 function renderShell() {
