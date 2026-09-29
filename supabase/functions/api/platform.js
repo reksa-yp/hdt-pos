@@ -28,8 +28,17 @@ import { sha256 as sha256Sync } from 'npm:js-sha256@0.11.0';
 export const TABLES = {
   Users: 'users', Categories: 'categories', Products: 'products', Customers: 'customers',
   Transactions: 'transactions', TxItems: 'tx_items', Evaluations: 'evaluations',
-  StockLog: 'stock_log', Settings: 'settings', Services: 'services'
+  StockLog: 'stock_log', Settings: 'settings', Services: 'services', Quotes: 'quotes'
 };
+
+// Tabel yang ditambahkan belakangan. Kalau tabelnya belum dibuat di Supabase
+// (schema.sql terbaru belum dijalankan ulang), fitur lain tetap jalan — hanya
+// fitur tabel itu yang menolak menyimpan dengan pesan yang jelas.
+const OPTIONAL_TABLES = { Quotes: 1 };
+function isMissingTable(error) {
+  const m = String((error && (error.code + ' ' + error.message)) || '');
+  return /42P01|PGRST205|does not exist|Could not find the table/i.test(m);
+}
 
 // "from"/"to" adalah kata kunci SQL, jadi di Postgres disimpan sebagai
 // period_from/period_to (lihat schema.sql). Core.gs sendiri tetap memakai
@@ -81,10 +90,12 @@ export function makeClient() {
 export async function prefetchAll(sb, SCHEMA) {
   const names = Object.keys(TABLES);
   const results = await Promise.all(names.map((t) => sb.from(TABLES[t]).select('*')));
-  const tables = {}, nextId = {};
+  const tables = {}, nextId = {}, missing = {};
   names.forEach((t, i) => {
-    const { data, error } = results[i];
-    if (error) { throw new Error('Gagal memuat tabel ' + t + ': ' + error.message); }
+    const { error } = results[i];
+    let data = results[i].data;
+    if (error && OPTIONAL_TABLES[t] && isMissingTable(error)) { missing[t] = 1; data = []; }
+    else if (error) { throw new Error('Gagal memuat tabel ' + t + ': ' + error.message); }
     tables[t] = data.map((r) => coerce(t, fromDb(t, r), SCHEMA));
     nextId[t] = tables[t].reduce((m, r) => Math.max(m, Number(r.id) || 0), 0);
   });
@@ -92,7 +103,7 @@ export async function prefetchAll(sb, SCHEMA) {
   if (kvErr) { throw new Error('Gagal memuat settings: ' + kvErr.message); }
   const kv = {};
   kvRows.forEach((r) => { kv[r.key] = r.value == null ? '' : String(r.value); });
-  return { tables, kv, nextId, writes: [] };
+  return { tables, kv, nextId, missing, writes: [] };
 }
 
 function makeDb(store) {
@@ -134,6 +145,9 @@ function makeDb(store) {
 
 export async function flush(sb, store) {
   for (const w of store.writes) {
+    if (w.table && store.missing && store.missing[w.table]) {
+      throw new Error('Tabel "' + TABLES[w.table] + '" belum ada di Supabase. Jalankan ulang supabase/schema.sql di SQL Editor.');
+    }
     if (w.op === 'insert') {
       const { error } = await sb.from(TABLES[w.table]).insert(toDb(w.table, w.row));
       if (error) { throw new Error('Gagal menyimpan ke ' + w.table + ': ' + error.message); }

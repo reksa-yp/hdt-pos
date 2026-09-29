@@ -441,7 +441,10 @@ var SCHEMA = {
   Evaluations: [['id','n'],['user_id','n'],['from','s'],['to','s'],['rating','n'],['bonus','n'],['note','s'],['updated_at','s'],['updated_by','s']],
   StockLog: [['id','n'],['date','s'],['product_id','n'],['name','s'],['user_name','s'],['type','s'],['change','n'],['before','n'],['after','n'],['note','s']],
   Settings: [['key','s'],['value','s']],
-  Services: [['id','n'],['service_no','s'],['date_in','s'],['date_out','s'],['customer_name','s'],['phone','s'],['item_name','s'],['item_color','s'],['completeness','s'],['problem','s'],['status','s'],['received_by','n'],['received_by_name','s'],['picked_up_at','s'],['note','s']]
+  Services: [['id','n'],['service_no','s'],['date_in','s'],['date_out','s'],['customer_name','s'],['phone','s'],['item_name','s'],['item_color','s'],['completeness','s'],['problem','s'],['status','s'],['received_by','n'],['received_by_name','s'],['picked_up_at','s'],['note','s']],
+  // Penawaran harga. Daftar barang/jasa disimpan sebagai teks JSON di kolom "items"
+  // (satu baris per penawaran) supaya simpan/sinkron offline cukup satu baris saja.
+  Quotes: [['id','n'],['quote_no','s'],['date','s'],['valid_days','n'],['valid_until','s'],['customer_name','s'],['customer_phone','s'],['customer_addr','s'],['items','s'],['subtotal','n'],['discount_type','s'],['discount_value','n'],['discount_amount','n'],['tax_rate','n'],['tax_amount','n'],['grand_total','n'],['note','s'],['user_id','n'],['user_name','s'],['created_at','s'],['updated_at','s']]
 };
 
 var SETTING_DEFAULTS = {
@@ -777,6 +780,95 @@ function createBackend_(P) {
   } };
   A.serviceGet = { roles: ['admin','kasir'], run: function(p){ var x=db.all('Services').filter(function(a){return a.id===int(p.id,'Service',1,1e12);})[0]; if(!x) fail('Data service tidak ditemukan.'); return pubService(x); } };
 
+  /* ----- penawaran harga (quotation) ----- */
+  function quoteItems(x) {
+    var arr = [];
+    try { arr = JSON.parse(x.items || '[]'); } catch (e) { arr = []; }
+    return Array.isArray(arr) ? arr : [];
+  }
+  function pubQuote(x, withItems) {
+    var o = { id: x.id, quote_no: x.quote_no, date: x.date, valid_days: x.valid_days, valid_until: x.valid_until,
+              customer_name: x.customer_name, customer_phone: x.customer_phone, customer_addr: x.customer_addr,
+              subtotal: x.subtotal, discount_type: x.discount_type, discount_value: x.discount_value, discount_amount: x.discount_amount,
+              tax_rate: x.tax_rate, tax_amount: x.tax_amount, grand_total: x.grand_total,
+              user_id: x.user_id, user_name: x.user_name, created_at: x.created_at, updated_at: x.updated_at };
+    if (withItems) { o.items = quoteItems(x); o.note = x.note; } else { o.item_count = quoteItems(x).length; }
+    return o;
+  }
+  function findQuote(id, user) {
+    id = refId(id, 'Penawaran');
+    var x = db.all('Quotes').filter(function (a) { return a.id === id; })[0];
+    if (!x) { fail('Penawaran tidak ditemukan (mungkin sudah dihapus).'); }
+    return x;
+  }
+  function canEditQuote(x, user) { return user.role === 'admin' || x.user_id === user.id; }
+
+  A.quoteList = { roles: ['admin', 'kasir'], run: function (p) {
+    var q = String(p.q || '').toLowerCase().trim();
+    var rows = db.all('Quotes').filter(function (x) {
+      return !q || (x.quote_no + ' ' + x.customer_name + ' ' + x.customer_phone + ' ' + x.user_name).toLowerCase().indexOf(q) >= 0;
+    });
+    rows.sort(function (a, b) { return (b.created_at < a.created_at ? -1 : b.created_at > a.created_at ? 1 : 0) || (b.id - a.id); });
+    return { total: rows.length, today: fmtDate_(P.now()), rows: rows.slice(0, 300).map(function (x) { return pubQuote(x, false); }) };
+  } };
+  A.quoteGet = { roles: ['admin', 'kasir'], run: function (p) { return pubQuote(findQuote(p.id), true); } };
+
+  A.quoteSave = { roles: ['admin', 'kasir'], write: true, run: function (p, user) {
+    var raw = p.items;
+    if (!Array.isArray(raw) || !raw.length) { fail('Tambahkan minimal satu barang/jasa.'); }
+    if (raw.length > 100) { fail('Terlalu banyak item dalam satu penawaran (maksimal 100).'); }
+    var items = [], subtotal = 0;
+    raw.forEach(function (it, i) {
+      var label = 'Item ke-' + (i + 1);
+      var name = str(it && it.name, 150, 'Nama ' + label.toLowerCase(), true);
+      var qty = num(it && it.qty, 'Qty ' + label.toLowerCase(), 0, 1e9);
+      if (qty <= 0) { fail('Qty ' + label.toLowerCase() + ' harus lebih dari 0.'); }
+      var price = num(it && it.price, 'Harga ' + label.toLowerCase(), 0, 1e12);
+      var sub = round2_(qty * price);
+      subtotal += sub;
+      items.push({ name: name, qty: qty, price: price, subtotal: sub });
+    });
+    subtotal = round2_(subtotal);
+    var discType = p.discount_type || 'none';
+    if (['none', 'percent', 'amount'].indexOf(discType) < 0) { fail('Jenis diskon tidak valid.'); }
+    var discValue = discType === 'none' ? 0 : num(p.discount_value || 0, 'Diskon', 0, 1e12);
+    if (discType === 'percent' && discValue > 100) { fail('Diskon persen tidak boleh lebih dari 100.'); }
+    var taxRate = num(p.tax_rate || 0, 'Pajak', 0, 100);
+    var tot = computeTotals(subtotal, discType, discValue, taxRate);
+    var date = isYmd_(p.date) ? p.date : fmtDate_(P.now());
+    var validDays = int(p.valid_days === undefined || p.valid_days === '' ? 14 : p.valid_days, 'Masa berlaku', 0, 3650);
+    var now = fmtDateTime_(P.now());
+    var o = {
+      date: date, valid_days: validDays, valid_until: addDays_(date, validDays),
+      customer_name: str(p.customer_name, 100, 'Nama pelanggan', false), customer_phone: str(p.customer_phone, 30, 'Telepon', false),
+      customer_addr: str(p.customer_addr, 250, 'Alamat', false), items: JSON.stringify(items),
+      subtotal: subtotal, discount_type: discType, discount_value: discValue, discount_amount: tot.discount,
+      tax_rate: taxRate, tax_amount: tot.tax, grand_total: tot.grand, note: str(p.note, 1000, 'Catatan', false), updated_at: now
+    };
+    var id = p.id ? refId(p.id, 'Penawaran') : 0;
+    if (id) {
+      var old = findQuote(id);
+      if (!canEditQuote(old, user)) { fail('Anda hanya dapat mengubah penawaran buatan sendiri.', 'FORBIDDEN'); }
+      return pubQuote(db.update('Quotes', id, o), true);
+    }
+    // nomor otomatis: PNW-YYMMDD-URUT3, urutan mulai 1 tiap hari
+    var ymd = fmtDate_(P.now()).replace(/-/g, '').slice(2), kv = db.kv();
+    var seq = (kv.quote_day === ymd) ? (Number(kv.quote_next) || 1) : 1;
+    o.quote_no = 'PNW-' + ymd + '-' + pad_(seq, 3);
+    o.user_id = user.id; o.user_name = user.full_name; o.created_at = now;
+    var res = db.insert('Quotes', o);
+    db.kvWrite({ quote_day: ymd, quote_next: String(seq + 1) }, []);
+    return pubQuote(res, true);
+  } };
+
+  A.quoteDelete = { roles: ['admin', 'kasir'], write: true, run: function (p, user) {
+    var ids = idList(p.ids);
+    db.all('Quotes').forEach(function (x) {
+      if (ids.indexOf(x.id) >= 0 && !canEditQuote(x, user)) { fail('Anda hanya dapat menghapus penawaran buatan sendiri (' + x.quote_no + ').', 'FORBIDDEN'); }
+    });
+    return { deleted: db.removeMany('Quotes', ids) };
+  } };
+
   /* ----- produk (admin) ----- */
   A.productList = { roles: ['admin'], run: function () {
     return { products: db.all('Products').map(function (p) { return pubProduct(p, true); }), categories: db.all('Categories').map(function (c) { return c.name; }) };
@@ -1091,7 +1183,7 @@ function createBackend_(P) {
     return {
       server_time: fmtDateTime_(P.now()), days: days,
       users: db.all('Users'), categories: db.all('Categories'), products: db.all('Products'), customers: db.all('Customers'),
-      transactions: tx, tx_items: items, services: db.all('Services'),
+      transactions: tx, tx_items: items, services: db.all('Services'), quotes: db.all('Quotes'),
       evaluations: user.role === 'admin' ? db.all('Evaluations') : [],
       kv: db.kv()
     };
@@ -1337,6 +1429,9 @@ async function initOffline() {
     state = { v: 1, secret: sha256Hex_('device' + Math.random() + Date.now()), tables: tables, kv: {}, outbox: [] };
   }
   if (!state.outbox) { state.outbox = []; }
+  // Perangkat yang datanya tersimpan sebelum ada tabel baru (mis. Quotes) belum punya
+  // wadahnya -- tambahkan tabel yang belum ada tanpa menyentuh data yang sudah tersimpan.
+  Object.keys(SCHEMA).forEach(function (k) { if (k !== 'Settings' && !Array.isArray(state.tables[k])) { state.tables[k] = []; } });
   if (!state.secret) { state.secret = sha256Hex_('device' + Math.random() + Date.now()); }
   var ldb = localDb_(state, scheduleSave_);
   var platform = {
@@ -1365,11 +1460,13 @@ async function serverCall(action, token, payload, timeoutMs) {
 }
 
 /* ---------- klasifikasi aksi: tabel target + cara antre saat offline ---------- */
-var WRITE_ACTIONS = { checkout: 1, serviceSave: 1, productSave: 1, productDelete: 1, productStock: 1, customerSave: 1, customerDelete: 1, userSave: 1, userDelete: 1, passwordChange: 1, settingsSave: 1, evalSave: 1 };
-var ACTION_TABLE = { serviceSave: 'Services', productSave: 'Products', productDelete: 'Products', productStock: 'Products', customerSave: 'Customers', customerDelete: 'Customers', userSave: 'Users', userDelete: 'Users', checkout: 'Transactions' };
-var SAVE_ACTIONS = { serviceSave: 1, productSave: 1, customerSave: 1, userSave: 1 };
-var DELETE_ACTIONS = { productDelete: 1, customerDelete: 1, userDelete: 1 };
+var WRITE_ACTIONS = { checkout: 1, serviceSave: 1, productSave: 1, productDelete: 1, productStock: 1, customerSave: 1, customerDelete: 1, userSave: 1, userDelete: 1, passwordChange: 1, settingsSave: 1, evalSave: 1, quoteSave: 1, quoteDelete: 1 };
+var ACTION_TABLE = { serviceSave: 'Services', productSave: 'Products', productDelete: 'Products', productStock: 'Products', customerSave: 'Customers', customerDelete: 'Customers', userSave: 'Users', userDelete: 'Users', checkout: 'Transactions', quoteSave: 'Quotes', quoteDelete: 'Quotes' };
+var SAVE_ACTIONS = { serviceSave: 1, productSave: 1, customerSave: 1, userSave: 1, quoteSave: 1 };
+var DELETE_ACTIONS = { productDelete: 1, customerDelete: 1, userDelete: 1, quoteDelete: 1 };
 var FK_RULES = {
+  quoteSave: [{ table: 'Quotes', kind: 'scalar', field: 'id' }],
+  quoteDelete: [{ table: 'Quotes', kind: 'array', field: 'ids' }],
   checkout: [{ table: 'Customers', kind: 'scalar', field: 'customer_id' }, { table: 'Products', kind: 'arrayField', field: 'items', sub: 'product_id' }],
   productStock: [{ table: 'Products', kind: 'scalar', field: 'id' }],
   productDelete: [{ table: 'Products', kind: 'array', field: 'ids' }],
@@ -1468,6 +1565,10 @@ function reconcileCreated_(entry, serverData) {
     (serverData.items || []).forEach(function (it) {
       OFF.db.insert('TxItems', { tx_id: newId, invoice_no: serverData.invoice_no, date: serverData.date, user_id: serverData.user_id, product_id: it.product_id, name: it.name, type: it.type, qty: it.qty, price: it.price, cost: 0, subtotal: it.subtotal });
     });
+  } else if (table === 'Quotes') {
+    // server mengembalikan items sebagai array; di tabel lokal disimpan sebagai teks JSON
+    OFF.db.replaceRow(table, oldId, Object.assign({}, serverData, { items: JSON.stringify(serverData.items || []) }));
+    if (typeof onQuoteSynced === 'function') { onQuoteSynced(oldId, serverData); }
   } else {
     OFF.db.replaceRow(table, oldId, serverData);
   }
@@ -1487,6 +1588,10 @@ async function pullFromServer() {
   OFF.db.replaceAll('Products', d.products);
   OFF.db.replaceAll('Customers', d.customers);
   OFF.db.replaceAll('Services', d.services);
+  if (Array.isArray(d.quotes)) {
+    // pertahankan penawaran yang dibuat di perangkat ini & belum tersinkron (id negatif)
+    OFF.db.replaceAll('Quotes', d.quotes.concat(OFF.db.all('Quotes').filter(function (r) { return r.id < 0; })));
+  }
   if (d.evaluations) { OFF.db.replaceAll('Evaluations', d.evaluations); }
   OFF.db.mergeWindow('Transactions', d.transactions);
   var txIds = (d.transactions || []).map(function (t) { return t.id; });
@@ -1897,17 +2002,32 @@ async function showInvoice(id) {
 }
 
 /* =====================================================================
-   PENAWARAN HARGA (quotation) — dibuat kasir/admin, format seperti invoice
+   PENAWARAN HARGA (quotation) — dibuat kasir/admin, format seperti invoice.
+   Disimpan ke database (tabel Quotes) lewat api('quoteSave'), jadi tidak hilang
+   setelah dicetak / halaman dimuat ulang: bisa dibuka, diubah, dicetak ulang,
+   atau dihapus dari tab "Tersimpan".
    ===================================================================== */
 const DEFAULT_QUOTE_NOTE = '1. Harga berlaku sampai dengan tanggal yang tercantum pada penawaran ini.\n2. Harga dapat berubah sewaktu-waktu setelah tanggal berlaku berakhir.\n3. Pembayaran dilakukan setelah kesepakatan/PO disetujui, sesuai ketentuan yang berlaku.\n4. Barang yang sudah dibeli tidak dapat ditukar atau dikembalikan.\n5. Untuk transaksi di atas Rp5.000.000 wajib memberikan DP minimal 50%.\n6. Dokumen ini adalah penawaran harga, bukan invoice atau bukti pembayaran.';
+S.quoteTab = 'form'; S.quoteQ = '';
 function newQuote() {
   return {
-    no: '', customer: '', phone: '', addr: '', date: ymdNow(), validDays: 14,
+    id: 0, no: '', userName: '', customer: '', phone: '', addr: '', date: ymdNow(), validDays: 14,
     items: [{ name: '', qty: 1, price: 0 }],
     discType: 'percent', discValue: 0, taxRate: Number(ST().tax_rate) || 0,
-    note: DEFAULT_QUOTE_NOTE
+    note: DEFAULT_QUOTE_NOTE, dirty: false
   };
 }
+function quoteFromServer(d) {
+  const items = (d.items && d.items.length ? d.items : [{ name: '', qty: 1, price: 0 }]);
+  return {
+    id: d.id, no: d.quote_no, userName: d.user_name || '', customer: d.customer_name || '', phone: d.customer_phone || '', addr: d.customer_addr || '',
+    date: d.date || ymdNow(), validDays: Number(d.valid_days) || 0,
+    items: items.map(l => ({ name: l.name || '', qty: Number(l.qty) || 0, price: Number(l.price) || 0 })),
+    discType: d.discount_type === 'amount' ? 'amount' : 'percent', discValue: Number(d.discount_value) || 0, taxRate: Number(d.tax_rate) || 0,
+    note: d.note || '', dirty: false
+  };
+}
+const quoteFilled = q => q.items.filter(l => l.name.trim() && (Number(l.qty) || 0) > 0);
 function quoteTotals(q) {
   const subtotal = q.items.reduce((a, l) => a + (Number(l.qty) || 0) * (Number(l.price) || 0), 0);
   let disc = q.discType === 'percent' ? Math.round(subtotal * (Number(q.discValue) || 0) / 100) : Math.round(Number(q.discValue) || 0);
@@ -1915,10 +2035,27 @@ function quoteTotals(q) {
   const taxable = subtotal - disc, tax = Math.round(taxable * (Number(q.taxRate) || 0) / 100);
   return { subtotal, disc, tax, grand: taxable + tax };
 }
-function nextQuoteNo() {
-  const ymd = ymdNow().replace(/-/g, '').slice(2), key = 'hdt_quote_seq_' + ymd;
-  const n = (Number(store.get(key)) || 0) + 1; store.set(key, String(n));
-  return 'PNW-' + ymd + '-' + String(n).padStart(3, '0');
+/** Simpan penawaran yang sedang dibuka (baru -> dapat nomor, lama -> diperbarui). */
+async function saveQuote(silent) {
+  const q = S.quote, items = quoteFilled(q);
+  if (!items.length) { toast('Tambahkan minimal satu barang/jasa dengan nama dan qty terisi.', 'err'); return false; }
+  const isNew = !q.id;
+  const d = await api('quoteSave', {
+    id: q.id || 0, customer_name: q.customer.trim(), customer_phone: q.phone.trim(), customer_addr: q.addr.trim(),
+    date: q.date, valid_days: Number(q.validDays) || 0,
+    items: items.map(l => ({ name: l.name.trim(), qty: Number(l.qty) || 0, price: Number(l.price) || 0 })),
+    discount_type: (Number(q.discValue) || 0) > 0 ? q.discType : 'none', discount_value: Number(q.discValue) || 0,
+    tax_rate: Number(q.taxRate) || 0, note: q.note
+  });
+  q.id = d.id; q.no = d.quote_no; q.userName = d.user_name || ''; q.dirty = false;
+  if (S.quote === q) { renderQuoteStatus(); }
+  if (!silent) { toast(isNew ? 'Penawaran ' + d.quote_no + ' tersimpan.' : 'Perubahan penawaran ' + d.quote_no + ' tersimpan.', 'ok'); }
+  return true;
+}
+/** Dipanggil mesin offline setelah penawaran yang dibuat offline mendapat id & nomor asli dari server. */
+function onQuoteSynced(oldId, d) {
+  if (S.quote && S.quote.id === oldId) { S.quote.id = d.id; S.quote.no = d.quote_no; renderQuoteStatus(); }
+  if (S.view === 'penawaran' && S.quoteTab === 'list') { loadQuotes(); }
 }
 function quoteHtml(q, items) {
   const s = ST(), logo = LOGO(), t = quoteTotals(Object.assign({}, q, { items }));
@@ -1943,17 +2080,18 @@ function quoteHtml(q, items) {
     '<table class="items"><thead><tr><th style="width:26px">#</th><th>Nama Barang/Jasa</th><th>Qty</th><th>Harga Satuan</th><th>Total</th></tr></thead><tbody>' + rows + '</tbody></table>' +
     '<div class="inv-end"><div class="inv-tot">' + tot + '</div>' +
     (noteLines.length ? '<div class="inv-note"><b>Catatan / Syarat &amp; Ketentuan:</b><ol>' + noteLines.map(l => '<li>' + esc(l.replace(/^\d+[.)]\s*/, '')) + '</li>').join('') + '</ol></div>' : '') +
-    '<div class="inv-sign"><div>Hormat kami,</div><div class="sp"></div><div class="nm">' + esc(S.user.full_name) + '</div></div></div>' +
+    '<div class="inv-sign"><div>Hormat kami,</div><div class="sp"></div><div class="nm">' + esc(q.userName || S.user.full_name) + '</div></div></div>' +
     '<div class="inv-foot"><span>Dibuat dengan HDT POS</span><span>Berlaku hingga ' + dmy(until) + '</span></div></div>';
 }
-async function showQuotePreview() {
-  const q = S.quote, items = q.items.filter(l => l.name.trim() && (Number(l.qty) || 0) > 0);
-  if (!items.length) { toast('Tambahkan minimal satu barang/jasa dengan nama dan qty terisi.', 'err'); return; }
-  if (!q.no) { q.no = nextQuoteNo(); }
+/** Pratinjau + cetak. Penawaran yang sedang diedit SELALU disimpan dulu, supaya tidak hilang setelah dicetak. */
+async function showQuotePreview(saved) {
+  const q = saved || S.quote;
+  if (!saved && !(await saveQuote(true))) { return; }
+  const items = quoteFilled(q);
   await warmLogo();
   const m = openModal({
     title: 'Penawaran ' + q.no, size: 'xl',
-    body: '<p class="muted" style="margin:0 0 10px">Klik <b>Cetak / Simpan PDF</b>, lalu pilih printer — atau pilih tujuan <b>Save as PDF</b> untuk menyimpannya sebagai file PDF.</p><div class="inv-scale" id="qBox"><div id="qInner">' + quoteHtml(q, items) + '</div></div>',
+    body: '<p class="muted" style="margin:0 0 10px">' + (saved ? '' : '<span class="badge ok">Tersimpan</span> Bisa dibuka lagi kapan saja dari tab <b>Tersimpan</b>. ') + 'Klik <b>Cetak / Simpan PDF</b>, lalu pilih printer — atau pilih tujuan <b>Save as PDF</b> untuk menyimpannya sebagai file PDF.</p><div class="inv-scale" id="qBox"><div id="qInner">' + quoteHtml(q, items) + '</div></div>',
     foot: '<button class="btn" data-close2>Tutup</button><button class="btn btn-primary" id="qPrint">Cetak / Simpan PDF</button>'
   });
   const fit = () => {
@@ -1965,6 +2103,15 @@ async function showQuotePreview() {
   setTimeout(fit, 20);
   m.$('[data-close2]').onclick = () => m.close();
   m.$('#qPrint').onclick = () => printDoc(quoteHtml(q, items), 'size:A4;margin:0');
+}
+function renderQuoteStatus() {
+  const q = S.quote, el = $('#qStatus');
+  if (el) {
+    el.innerHTML = q.id
+      ? '<span class="badge ' + (q.dirty ? 'warn">Ada perubahan belum disimpan' : 'ok">Tersimpan') + '</span> No. <b>' + esc(q.no) + '</b>' + (q.userName ? ' · dibuat oleh ' + esc(q.userName) : '')
+      : '<span class="badge">Belum disimpan</span> Nomor penawaran dibuat otomatis saat disimpan.';
+  }
+  const tb = $('[data-act="quoteTab"][data-tab="form"]'); if (tb) { tb.textContent = q.id ? 'Edit ' + q.no : 'Buat penawaran'; }
 }
 function renderQuoteRowSubtotal(i) {
   const row = $('#qItems tbody tr:nth-child(' + (i + 1) + ')'); if (!row) { return; }
@@ -1992,6 +2139,7 @@ function renderQuoteItems() {
     '<td class="num">' + rp((Number(l.qty) || 0) * (Number(l.price) || 0)) + '</td>' +
     '<td><button type="button" class="btn btn-sm btn-ghost" data-act="quoteDelItem" data-i="' + i + '" aria-label="Hapus baris" title="Hapus baris">✕</button></td></tr>').join('');
 }
+function markQuoteDirty() { if (!S.quote.dirty) { S.quote.dirty = true; renderQuoteStatus(); } }
 function bindQuoteForm() {
   const q = S.quote;
   $('#qCust').oninput = e => { q.customer = e.target.value; };
@@ -2018,13 +2166,30 @@ function bindQuoteForm() {
     else if (f === 'price') { l.price = moneyVal(i.value) || 0; i.value = l.price ? moneyTxt(l.price) : ''; }
     renderQuoteRowSubtotal(idx); renderQuoteTotals();
   });
-  renderQuoteValidTxt();
+  const form = $('#qForm');
+  form.addEventListener('input', markQuoteDirty);
+  form.addEventListener('change', markQuoteDirty);
+  renderQuoteValidTxt(); renderQuoteStatus();
+}
+function quoteTabs() {
+  const tab = S.quoteTab, q = S.quote;
+  return '<div class="seg" role="group" aria-label="Penawaran" style="margin-bottom:14px">' +
+    '<button type="button" data-act="quoteTab" data-tab="form" aria-pressed="' + (tab === 'form') + '">' + (q.id ? 'Edit ' + esc(q.no) : 'Buat penawaran') + '</button>' +
+    '<button type="button" data-act="quoteTab" data-tab="list" aria-pressed="' + (tab === 'list') + '">Tersimpan</button></div>';
 }
 function viewPenawaran() {
   if (!S.quote) { S.quote = newQuote(); }
   const q = S.quote;
-  $('#view').innerHTML = '<div class="page">' +
-    pageHead('Penawaran Harga', 'Buat penawaran harga untuk pelanggan — bisa dicetak atau disimpan sebagai PDF, formatnya seperti invoice.', '<button type="button" class="btn" data-act="quoteReset">+ Penawaran baru</button>') +
+  const head = pageHead('Penawaran Harga', 'Buat, simpan, dan cetak penawaran harga untuk pelanggan — formatnya seperti invoice.', '<button type="button" class="btn" data-act="quoteReset">+ Penawaran baru</button>');
+  if (S.quoteTab === 'list') {
+    $('#view').innerHTML = '<div class="page">' + head + quoteTabs() +
+      '<div class="card"><div class="toolbar"><input type="search" id="qlq" placeholder="Cari no. penawaran / pelanggan…" value="' + esc(S.quoteQ) + '" data-inp="quoteQ" aria-label="Cari penawaran"></div>' +
+      '<div id="qList"><div class="empty">Memuat…</div></div></div></div>';
+    loadQuotes();
+    return;
+  }
+  $('#view').innerHTML = '<div class="page">' + head + quoteTabs() +
+    '<p class="muted" id="qStatus" style="margin:0 0 12px"></p><div id="qForm">' +
     '<div class="card" style="margin-bottom:14px"><div class="card-head"><h2>Pelanggan</h2></div><div class="card-body">' +
     '<div class="grid2"><label class="field"><span>Nama pelanggan / perusahaan</span><input id="qCust" type="text" maxlength="100" value="' + esc(q.customer) + '" placeholder="Contoh: PT. Shinwon Indonesia"></label>' +
     '<label class="field"><span>Telepon (opsional)</span><input id="qPhone" type="text" maxlength="30" inputmode="tel" value="' + esc(q.phone) + '"></label></div>' +
@@ -2042,15 +2207,44 @@ function viewPenawaran() {
     '<input id="qDiscVal" type="text" inputmode="numeric" class="money" placeholder="0"></div></div>' +
     '<label class="field"><span>Pajak / PPN (%)</span><input id="qTax" type="text" inputmode="decimal" value="' + esc(String(q.taxRate)) + '"></label></div></div></div>' +
     '<div class="card" style="margin-bottom:14px"><div class="card-head"><h2>Catatan / Syarat &amp; Ketentuan</h2></div><div class="card-body">' +
-    '<textarea id="qNote" rows="5" maxlength="600">' + esc(q.note) + '</textarea></div></div>' +
+    '<textarea id="qNote" rows="5" maxlength="1000">' + esc(q.note) + '</textarea></div></div></div>' +
     '<div class="card"><div class="card-body">' +
     '<div class="sum-row"><span>Subtotal</span><b id="qSub">Rp 0</b></div>' +
     '<div class="sum-row" id="qRowDisc" hidden><span class="muted">Potongan diskon</span><span id="qDiscOut"></span></div>' +
     '<div class="sum-row" id="qRowTax" hidden><span class="muted" id="qTaxLbl"></span><span id="qTaxOut"></span></div>' +
     '<div class="lcd"><span>TOTAL PENAWARAN</span><strong id="qTotal">Rp 0</strong></div>' +
-    '<button type="button" class="btn btn-primary" style="width:100%;min-height:48px;margin-top:6px" data-act="quotePreview">Pratinjau &amp; Cetak Penawaran</button>' +
+    '<div style="display:flex;gap:8px;margin-top:6px"><button type="button" class="btn" style="flex:1;min-height:48px" data-act="quoteSave">Simpan</button>' +
+    '<button type="button" class="btn btn-primary" style="flex:2;min-height:48px" data-act="quotePreview">Simpan &amp; Cetak</button></div>' +
     '</div></div></div>';
   renderQuoteItems(); bindQuoteForm(); renderQuoteTotals();
+}
+async function loadQuotes() {
+  try { drawQuotes(await api('quoteList', { q: S.quoteQ })); }
+  catch (e) { const el = $('#qList'); if (el && e.code !== 'AUTH') { el.innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; } }
+}
+function drawQuotes(r) {
+  const el = $('#qList'); if (!el) { return; }
+  const admin = S.user.role === 'admin', today = r.today || ymdNow();
+  el.innerHTML = r.rows.length ? '<div class="tscroll"><table class="t"><thead><tr><th>No. penawaran</th><th class="hide-sm">Tanggal</th><th>Pelanggan</th><th class="hide-sm">Berlaku hingga</th><th class="num">Total</th><th></th></tr></thead><tbody>' +
+    r.rows.map(x => {
+      const expired = x.valid_until && x.valid_until < today, mine = admin || x.user_id === S.user.id;
+      return '<tr><td><b>' + esc(x.quote_no) + '</b>' + (x.id < 0 ? ' <span class="badge warn" title="Tersimpan di perangkat, menunggu sinkron ke server">Antre</span>' : '') +
+        '<small>' + esc(x.user_name) + ' · ' + x.item_count + ' item</small></td>' +
+        '<td class="hide-sm nowrap">' + dmy(x.date) + '</td>' +
+        '<td>' + (x.customer_name ? esc(x.customer_name) : '<span class="muted">-</span>') + '</td>' +
+        '<td class="hide-sm nowrap">' + dmy(x.valid_until) + ' <span class="badge ' + (expired ? 'danger">Kedaluwarsa' : 'ok">Berlaku') + '</span></td>' +
+        '<td class="num">' + rp(x.grand_total) + '</td>' +
+        '<td class="nowrap num">' + (mine ? '<button type="button" class="btn btn-sm" data-act="quoteOpen" data-id="' + x.id + '">Buka</button> ' : '') +
+        '<button type="button" class="btn btn-sm btn-primary" data-act="quotePrintSaved" data-id="' + x.id + '">Cetak</button>' +
+        (mine ? ' <button type="button" class="btn btn-sm btn-ghost" data-act="quoteDel" data-id="' + x.id + '" data-no="' + esc(x.quote_no) + '" aria-label="Hapus ' + esc(x.quote_no) + '" title="Hapus">✕</button>' : '') + '</td></tr>';
+    }).join('') +
+    '</tbody><tfoot><tr><td colspan="6">' + r.total + ' penawaran' + (r.total > r.rows.length ? ' (menampilkan ' + r.rows.length + ' terbaru — gunakan pencarian)' : '') + '</td></tr></tfoot></table></div>'
+    : '<div class="empty"><strong>' + (S.quoteQ ? 'Penawaran tidak ditemukan' : 'Belum ada penawaran tersimpan') + '</strong>' + (S.quoteQ ? 'Coba kata kunci lain.' : 'Penawaran tersimpan otomatis saat Anda menekan Simpan atau Simpan &amp; Cetak.') + '</div>';
+}
+function leaveQuoteOk() {
+  const q = S.quote;
+  if (!q || !(q.dirty || (!q.id && quoteFilled(q).length))) { return Promise.resolve(true); }
+  return confirmBox({ title: 'Tinggalkan penawaran ini?', message: q.id ? 'Perubahan pada ' + esc(q.no) + ' belum disimpan dan akan hilang.' : 'Penawaran yang sedang dibuat belum disimpan dan akan hilang.', ok: 'Ya, tinggalkan', danger: true });
 }
 
 /* =====================================================================
@@ -3256,11 +3450,32 @@ function printService(x,paper){ printDoc(serviceReceiptMarkup(x,paper),'size:'+p
 /* ---------- daftar layar ---------- */
 Object.assign(ACT,{serviceNew(){serviceForm();},serviceEdit(t){run(t,async()=>serviceForm(await api('serviceGet',{id:Number(t.dataset.id)})));},servicePrint(t){run(t,async()=>openServicePreview(await api('serviceGet',{id:Number(t.dataset.id)})));}});
 Object.assign(ACT, {
-  quoteReset() { confirmBox({ title: 'Penawaran baru?', message: 'Form akan dikosongkan dan diisi ulang dari awal.', ok: 'Ya, mulai baru' }).then(y => { if (y) { S.quote = newQuote(); viewPenawaran(); } }); },
-  quoteAddItem() { S.quote.items.push({ name: '', qty: 1, price: 0 }); renderQuoteItems(); renderQuoteTotals(); const ins = $('#qItems tbody tr:last-child input'); if (ins) { ins.focus(); } },
-  quoteDelItem(t) { const i = Number(t.dataset.i); S.quote.items.splice(i, 1); if (!S.quote.items.length) { S.quote.items.push({ name: '', qty: 1, price: 0 }); } renderQuoteItems(); renderQuoteTotals(); },
-  quotePreview() { showQuotePreview(); }
+  quoteReset() { leaveQuoteOk().then(y => { if (y) { S.quote = newQuote(); S.quoteTab = 'form'; viewPenawaran(); } }); },
+  quoteTab(t) { S.quoteTab = t.dataset.tab === 'list' ? 'list' : 'form'; viewPenawaran(); },
+  quoteAddItem() { S.quote.items.push({ name: '', qty: 1, price: 0 }); markQuoteDirty(); renderQuoteItems(); renderQuoteTotals(); const ins = $('#qItems tbody tr:last-child input'); if (ins) { ins.focus(); } },
+  quoteDelItem(t) { const i = Number(t.dataset.i); S.quote.items.splice(i, 1); if (!S.quote.items.length) { S.quote.items.push({ name: '', qty: 1, price: 0 }); } markQuoteDirty(); renderQuoteItems(); renderQuoteTotals(); },
+  quoteSave(t) { run(t, () => saveQuote(false)); },
+  quotePreview(t) { run(t, () => showQuotePreview()); },
+  quoteOpen(t) {
+    const id = Number(t.dataset.id);
+    const open = () => run(t, async () => { const d = await api('quoteGet', { id }); S.quote = quoteFromServer(d); S.quoteTab = 'form'; viewPenawaran(); });
+    if (S.quote && S.quote.id === id) { S.quoteTab = 'form'; viewPenawaran(); return; }
+    leaveQuoteOk().then(y => { if (y) { open(); } });
+  },
+  quotePrintSaved(t) { run(t, async () => { const d = await api('quoteGet', { id: Number(t.dataset.id) }); await showQuotePreview(quoteFromServer(d)); }); },
+  quoteDel(t) {
+    const id = Number(t.dataset.id), no = t.dataset.no;
+    confirmBox({ title: 'Hapus penawaran?', message: 'Penawaran <b>' + esc(no) + '</b> akan dihapus permanen dari database.', ok: 'Hapus', danger: true }).then(y => {
+      if (!y) { return; }
+      run(null, async () => {
+        await api('quoteDelete', { ids: [id] });
+        if (S.quote && S.quote.id === id) { S.quote = newQuote(); }
+        toast('Penawaran ' + no + ' dihapus.', 'ok'); loadQuotes();
+      });
+    });
+  }
 });
+Object.assign(INP, { quoteQ: debounce(t => { S.quoteQ = t.value; loadQuotes(); }, 250) });
 Object.assign(VIEWS, {
   kasir() { viewKasir(); if (catalogStale) { catalogStale = false; refreshCatalog(true); } },
   dashboard: viewDashboard, riwayat: viewRiwayat, service: viewService, penawaran: viewPenawaran, produk: viewProduk, pelanggan: viewPelanggan,

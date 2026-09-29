@@ -155,6 +155,33 @@ create table if not exists services (
 create index if not exists idx_services_status on services(status);
 create index if not exists idx_services_date on services(date_in);
 
+-- Penawaran harga. "items" berisi daftar barang/jasa dalam bentuk teks JSON
+-- (sama seperti kolom "items" di sheet Quotes pada Google Sheets).
+create table if not exists quotes (
+  id               bigint primary key,
+  quote_no         text unique,
+  date             text,
+  valid_days       integer not null default 14,
+  valid_until      text,
+  customer_name    text,
+  customer_phone   text,
+  customer_addr    text,
+  items            text not null default '[]',
+  subtotal         numeric(14,2) not null default 0,
+  discount_type    text,
+  discount_value   numeric(14,2) default 0,
+  discount_amount  numeric(14,2) default 0,
+  tax_rate         numeric(6,2) default 0,
+  tax_amount       numeric(14,2) default 0,
+  grand_total      numeric(14,2) not null default 0,
+  note             text,
+  user_id          bigint,
+  user_name        text,
+  created_at       text,
+  updated_at       text
+);
+create index if not exists idx_quotes_date on quotes(date);
+
 -- Kunci sederhana untuk operasi tulis (checkout, dsb) supaya tidak tabrakan
 -- saat dua request datang bersamaan — dipakai oleh P.lock() di platform.js,
 -- setara LockService.getScriptLock() di Apps Script.
@@ -191,4 +218,5 @@ alter table evaluations  enable row level security;
 alter table stock_log    enable row level security;
 alter table settings     enable row level security;
 alter table services     enable row level security;
+alter table quotes       enable row level security;
 alter table _locks       enable row level security;

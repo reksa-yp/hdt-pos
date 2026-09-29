@@ -23,7 +23,10 @@ var SCHEMA = {
   Evaluations: [['id','n'],['user_id','n'],['from','s'],['to','s'],['rating','n'],['bonus','n'],['note','s'],['updated_at','s'],['updated_by','s']],
   StockLog: [['id','n'],['date','s'],['product_id','n'],['name','s'],['user_name','s'],['type','s'],['change','n'],['before','n'],['after','n'],['note','s']],
   Settings: [['key','s'],['value','s']],
-  Services: [['id','n'],['service_no','s'],['date_in','s'],['date_out','s'],['customer_name','s'],['phone','s'],['item_name','s'],['item_color','s'],['completeness','s'],['problem','s'],['status','s'],['received_by','n'],['received_by_name','s'],['picked_up_at','s'],['note','s']]
+  Services: [['id','n'],['service_no','s'],['date_in','s'],['date_out','s'],['customer_name','s'],['phone','s'],['item_name','s'],['item_color','s'],['completeness','s'],['problem','s'],['status','s'],['received_by','n'],['received_by_name','s'],['picked_up_at','s'],['note','s']],
+  // Penawaran harga. Daftar barang/jasa disimpan sebagai teks JSON di kolom "items"
+  // (satu baris per penawaran) supaya simpan/sinkron offline cukup satu baris saja.
+  Quotes: [['id','n'],['quote_no','s'],['date','s'],['valid_days','n'],['valid_until','s'],['customer_name','s'],['customer_phone','s'],['customer_addr','s'],['items','s'],['subtotal','n'],['discount_type','s'],['discount_value','n'],['discount_amount','n'],['tax_rate','n'],['tax_amount','n'],['grand_total','n'],['note','s'],['user_id','n'],['user_name','s'],['created_at','s'],['updated_at','s']]
 };
 
 var SETTING_DEFAULTS = {
@@ -359,6 +362,95 @@ function createBackend_(P) {
   } };
   A.serviceGet = { roles: ['admin','kasir'], run: function(p){ var x=db.all('Services').filter(function(a){return a.id===int(p.id,'Service',1,1e12);})[0]; if(!x) fail('Data service tidak ditemukan.'); return pubService(x); } };
 
+  /* ----- penawaran harga (quotation) ----- */
+  function quoteItems(x) {
+    var arr = [];
+    try { arr = JSON.parse(x.items || '[]'); } catch (e) { arr = []; }
+    return Array.isArray(arr) ? arr : [];
+  }
+  function pubQuote(x, withItems) {
+    var o = { id: x.id, quote_no: x.quote_no, date: x.date, valid_days: x.valid_days, valid_until: x.valid_until,
+              customer_name: x.customer_name, customer_phone: x.customer_phone, customer_addr: x.customer_addr,
+              subtotal: x.subtotal, discount_type: x.discount_type, discount_value: x.discount_value, discount_amount: x.discount_amount,
+              tax_rate: x.tax_rate, tax_amount: x.tax_amount, grand_total: x.grand_total,
+              user_id: x.user_id, user_name: x.user_name, created_at: x.created_at, updated_at: x.updated_at };
+    if (withItems) { o.items = quoteItems(x); o.note = x.note; } else { o.item_count = quoteItems(x).length; }
+    return o;
+  }
+  function findQuote(id, user) {
+    id = refId(id, 'Penawaran');
+    var x = db.all('Quotes').filter(function (a) { return a.id === id; })[0];
+    if (!x) { fail('Penawaran tidak ditemukan (mungkin sudah dihapus).'); }
+    return x;
+  }
+  function canEditQuote(x, user) { return user.role === 'admin' || x.user_id === user.id; }
+
+  A.quoteList = { roles: ['admin', 'kasir'], run: function (p) {
+    var q = String(p.q || '').toLowerCase().trim();
+    var rows = db.all('Quotes').filter(function (x) {
+      return !q || (x.quote_no + ' ' + x.customer_name + ' ' + x.customer_phone + ' ' + x.user_name).toLowerCase().indexOf(q) >= 0;
+    });
+    rows.sort(function (a, b) { return (b.created_at < a.created_at ? -1 : b.created_at > a.created_at ? 1 : 0) || (b.id - a.id); });
+    return { total: rows.length, today: fmtDate_(P.now()), rows: rows.slice(0, 300).map(function (x) { return pubQuote(x, false); }) };
+  } };
+  A.quoteGet = { roles: ['admin', 'kasir'], run: function (p) { return pubQuote(findQuote(p.id), true); } };
+
+  A.quoteSave = { roles: ['admin', 'kasir'], write: true, run: function (p, user) {
+    var raw = p.items;
+    if (!Array.isArray(raw) || !raw.length) { fail('Tambahkan minimal satu barang/jasa.'); }
+    if (raw.length > 100) { fail('Terlalu banyak item dalam satu penawaran (maksimal 100).'); }
+    var items = [], subtotal = 0;
+    raw.forEach(function (it, i) {
+      var label = 'Item ke-' + (i + 1);
+      var name = str(it && it.name, 150, 'Nama ' + label.toLowerCase(), true);
+      var qty = num(it && it.qty, 'Qty ' + label.toLowerCase(), 0, 1e9);
+      if (qty <= 0) { fail('Qty ' + label.toLowerCase() + ' harus lebih dari 0.'); }
+      var price = num(it && it.price, 'Harga ' + label.toLowerCase(), 0, 1e12);
+      var sub = round2_(qty * price);
+      subtotal += sub;
+      items.push({ name: name, qty: qty, price: price, subtotal: sub });
+    });
+    subtotal = round2_(subtotal);
+    var discType = p.discount_type || 'none';
+    if (['none', 'percent', 'amount'].indexOf(discType) < 0) { fail('Jenis diskon tidak valid.'); }
+    var discValue = discType === 'none' ? 0 : num(p.discount_value || 0, 'Diskon', 0, 1e12);
+    if (discType === 'percent' && discValue > 100) { fail('Diskon persen tidak boleh lebih dari 100.'); }
+    var taxRate = num(p.tax_rate || 0, 'Pajak', 0, 100);
+    var tot = computeTotals(subtotal, discType, discValue, taxRate);
+    var date = isYmd_(p.date) ? p.date : fmtDate_(P.now());
+    var validDays = int(p.valid_days === undefined || p.valid_days === '' ? 14 : p.valid_days, 'Masa berlaku', 0, 3650);
+    var now = fmtDateTime_(P.now());
+    var o = {
+      date: date, valid_days: validDays, valid_until: addDays_(date, validDays),
+      customer_name: str(p.customer_name, 100, 'Nama pelanggan', false), customer_phone: str(p.customer_phone, 30, 'Telepon', false),
+      customer_addr: str(p.customer_addr, 250, 'Alamat', false), items: JSON.stringify(items),
+      subtotal: subtotal, discount_type: discType, discount_value: discValue, discount_amount: tot.discount,
+      tax_rate: taxRate, tax_amount: tot.tax, grand_total: tot.grand, note: str(p.note, 1000, 'Catatan', false), updated_at: now
+    };
+    var id = p.id ? refId(p.id, 'Penawaran') : 0;
+    if (id) {
+      var old = findQuote(id);
+      if (!canEditQuote(old, user)) { fail('Anda hanya dapat mengubah penawaran buatan sendiri.', 'FORBIDDEN'); }
+      return pubQuote(db.update('Quotes', id, o), true);
+    }
+    // nomor otomatis: PNW-YYMMDD-URUT3, urutan mulai 1 tiap hari
+    var ymd = fmtDate_(P.now()).replace(/-/g, '').slice(2), kv = db.kv();
+    var seq = (kv.quote_day === ymd) ? (Number(kv.quote_next) || 1) : 1;
+    o.quote_no = 'PNW-' + ymd + '-' + pad_(seq, 3);
+    o.user_id = user.id; o.user_name = user.full_name; o.created_at = now;
+    var res = db.insert('Quotes', o);
+    db.kvWrite({ quote_day: ymd, quote_next: String(seq + 1) }, []);
+    return pubQuote(res, true);
+  } };
+
+  A.quoteDelete = { roles: ['admin', 'kasir'], write: true, run: function (p, user) {
+    var ids = idList(p.ids);
+    db.all('Quotes').forEach(function (x) {
+      if (ids.indexOf(x.id) >= 0 && !canEditQuote(x, user)) { fail('Anda hanya dapat menghapus penawaran buatan sendiri (' + x.quote_no + ').', 'FORBIDDEN'); }
+    });
+    return { deleted: db.removeMany('Quotes', ids) };
+  } };
+
   /* ----- produk (admin) ----- */
   A.productList = { roles: ['admin'], run: function () {
     return { products: db.all('Products').map(function (p) { return pubProduct(p, true); }), categories: db.all('Categories').map(function (c) { return c.name; }) };
@@ -673,7 +765,7 @@ function createBackend_(P) {
     return {
       server_time: fmtDateTime_(P.now()), days: days,
       users: db.all('Users'), categories: db.all('Categories'), products: db.all('Products'), customers: db.all('Customers'),
-      transactions: tx, tx_items: items, services: db.all('Services'),
+      transactions: tx, tx_items: items, services: db.all('Services'), quotes: db.all('Quotes'),
       evaluations: user.role === 'admin' ? db.all('Evaluations') : [],
       kv: db.kv()
     };

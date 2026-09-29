@@ -133,3 +133,12 @@ Kalau sudah ada data produksi di Google Sheets yang mau dipindah:
   sekarang di Apps Script. Ini bukan lubang keamanan karena tidak ada
   data yang bisa diakses tanpa lewat `handle()` di Core.gs, yang tetap
   mengecek token itu sendiri.
+
+## Update: penawaran harga tersimpan ke database
+
+Menu **Penawaran** sekarang menyimpan setiap penawaran ke tabel `quotes`
+(Google Sheets: sheet `Quotes`, dibuat otomatis). Untuk database Supabase
+yang sudah berjalan, jalankan ulang `supabase/schema.sql` di SQL Editor
+satu kali — aman, semua perintahnya `if not exists` / `on conflict do nothing`,
+data lama tidak tersentuh. Sebelum itu dijalankan, fitur lain tetap normal;
+hanya menyimpan penawaran yang ditolak dengan pesan yang jelas.
