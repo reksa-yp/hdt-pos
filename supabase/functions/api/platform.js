@@ -45,7 +45,26 @@ function isMissingTable(error) {
 // nama field aslinya (from/to) — pemetaan dua arah ditangani di sini saja.
 const FIELD_ALIAS = { Evaluations: { from: 'period_from', to: 'period_to' } };
 
+// Core.gs memakai angka 0 untuk "tidak ada" (mis. transaksi pelanggan umum
+// punya customer_id 0). Di Postgres kolom-kolom ini FOREIGN KEY, dan id 0
+// tidak pernah ada -> insert ditolak ("violates foreign key constraint").
+// Akibatnya dulu SEMUA penjualan ke pelanggan umum gagal tersimpan dan
+// tertahan di antrean perangkat. Nilai 0 dikirim sebagai NULL; saat dibaca
+// lagi, coerce() di bawah mengubah NULL kembali menjadi 0 untuk Core.gs.
+const FK_ZERO_NULL = {
+  Transactions: ['customer_id', 'user_id'],
+  TxItems: ['tx_id', 'user_id', 'product_id'],
+  StockLog: ['product_id'],
+  Evaluations: ['user_id'],
+  Services: ['received_by']
+};
+
 function toDb(t, obj) {
+  const fks = FK_ZERO_NULL[t];
+  if (fks) {
+    obj = Object.assign({}, obj);
+    fks.forEach((k) => { if (k in obj && !Number(obj[k])) { obj[k] = null; } });
+  }
   const alias = FIELD_ALIAS[t];
   if (!alias) return obj;
   const out = {};

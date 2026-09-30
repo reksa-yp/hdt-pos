@@ -1720,7 +1720,9 @@ async function api(action, payload) {
     // baca: kalau online, coba server dulu (data paling baru); kalau gagal karena apa pun
     // (offline, jaringan, atau token server tidak valid), pakai data lokal -- jangan
     // langsung mengeluarkan pengguna hanya karena server menolak, selama sesi lokal masih sah.
-    if (navigator.onLine && getWebAppUrl() && S.token) {
+    // transaksi yang belum tersinkron (id negatif) hanya ada di perangkat ini
+    var localOnly = (action === 'txGet' || action === 'invoiceGet') && payload && isPendingId_(payload.id);
+    if (!localOnly && navigator.onLine && getWebAppUrl() && S.token) {
       var why = null;
       try {
         var r = await serverCall(action, S.token, payload, 15000);
@@ -1743,6 +1745,15 @@ async function api(action, payload) {
 }
 /** Daftar penawaran dari server belum memuat penawaran yang baru dibuat di perangkat ini & masih antre. */
 function withLocalPending_(action, payload, data) {
+  if (action === 'txList' && data && Array.isArray(data.rows)) {
+    // penjualan yang masih antre di perangkat ini belum ada di server -- tetap tampilkan
+    var lt = OFF.backend.handle('txList', localToken_(), payload || {});
+    if (lt.ok && Array.isArray(lt.data.rows)) {
+      var pt = lt.data.rows.filter(function (r) { return r.id < 0; });
+      if (pt.length) { data.rows = pt.concat(data.rows); data.total += pt.length; }
+    }
+    return data;
+  }
   if (action !== 'quoteList' || !data || !Array.isArray(data.rows)) { return data; }
   var loc = OFF.backend.handle('quoteList', localToken_(), payload || {});
   if (loc.ok) {
