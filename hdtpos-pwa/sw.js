@@ -4,7 +4,7 @@
  * dibuka dan dipakai walau tidak ada internet sama sekali. Data (produk,
  * transaksi, dst) disimpan terpisah di IndexedDB oleh index.html, bukan di sini.
  */
-const CACHE_NAME = 'hdtpos-shell-v3';
+const CACHE_NAME = 'hdtpos-shell-v4';
 const SHELL_FILES = [
   './',
   './index.html',
