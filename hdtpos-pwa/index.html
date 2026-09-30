@@ -174,6 +174,7 @@ input[type=checkbox]{ width:18px; height:18px; accent-color:var(--brand); vertic
 .service-preview-paper{display:flex;justify-content:center;padding:18px;background:var(--surface-2);border:1px solid var(--line);border-radius:14px;overflow:auto}
 .service-preview-paper .receipt{box-shadow:0 8px 24px rgba(0,0,0,.12)}
 .sr-barcode{display:block;width:100%;height:38px;margin:9px auto 3px}
+.pg-break{break-after:page;page-break-after:always;height:0}
 .sr-barcode-text{text-align:center;font-size:10px;letter-spacing:1px}
 .service-paper-options{display:grid;gap:10px}
 .service-paper-option{display:flex;gap:9px;align-items:flex-start;padding:12px;border:1px solid var(--line);border-radius:12px;cursor:pointer}
@@ -2095,6 +2096,18 @@ async function escService(x, paper) {
     .barcode(x.service_no).sep().center().lines(s.receipt_footer || 'Terima kasih telah menggunakan layanan service kami.').left();
   return p.feed(4).cut().bytes();
 }
+async function escServiceLabel(x, paper) {
+  const s = ST(), p = new EscPos(paper);
+  p.init();
+  if (LOGO() && PRN.logo()) { await p.logo(LOGO()); } else { p.center().bold(1).size(0x11).lines(s.store_name || 'Hardware Technology').size(0).bold(0); }
+  p.left().sep().center().bold(1).ln('LABEL SERVICE').bold(0).left().sep()
+    .lr('Pelanggan', x.customer_name || '-').lr('Tanggal', dmyhm(x.date_in)).lr('No. HP', x.phone || '-').sep()
+    .lr('Barang', x.item_name || '-').lr('Warna', x.item_color || '-').lr('Kelengkapan', x.completeness || '-')
+    .bold(1).ln('Masalah:').bold(0).lines(x.problem || '-')
+    .bold(1).ln('Catatan:').bold(0).lines(x.note || '-').sep()
+    .barcode(x.service_no);
+  return p.feed(4).cut().bytes();
+}
 function escTest(paper) {
   const p = new EscPos(paper);
   p.init().center().bold(1).size(0x11).lines('TES PRINTER').size(0).bold(0).lines(ST().store_name || 'HDT POS')
@@ -2215,7 +2228,7 @@ async function printThermal(kind, data, paper) {
   paper = paper === 58 ? 58 : 80;
   const mode = PRN.mode();
   if (mode === 'browser') {
-    const html = kind === 'service' ? serviceReceiptMarkup(data, paper) : receiptHtml(data, paper);
+    const html = kind === 'service' ? servicePartsMarkup(data.x, paper, data.what).join('<div class="pg-break"></div>') : receiptHtml(data, paper);
     return printDoc(html, 'size:' + paper + 'mm auto;margin:0');
   }
   try {
@@ -2224,7 +2237,14 @@ async function printThermal(kind, data, paper) {
       if (!BT.device) { await BT.restore(); }
       if (!BT.device) { await BT.pick(); }            // pilih printer dulu selagi masih dalam klik pengguna
     }
-    const bytes = kind === 'service' ? await escService(data, paper) : kind === 'test' ? escTest(paper) : await escReceipt(data, paper);
+    let bytes;
+    if (kind === 'service') {
+      const chunks = [];
+      if (data.what !== 'label') { chunks.push(await escService(data.x, paper)); }
+      if (data.what !== 'struk') { chunks.push(await escServiceLabel(data.x, paper)); }
+      bytes = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+      chunks.reduce((o, c) => { bytes.set(c, o); return o + c.length; }, 0);
+    } else { bytes = kind === 'test' ? escTest(paper) : await escReceipt(data, paper); }
     if (mode === 'rawbt') { rawbtSend(bytes); return; }
     toast('Mengirim struk ke ' + BT.name() + '…');
     await BT.write(bytes);
@@ -3799,20 +3819,25 @@ function serviceForm(x){
   };
 }
 function serviceStatusLabel(s){return ({proses:'Masih proses',tersedia:'Masih di tempat',diambil:'Sudah diambil'}[s]||s||'-');}
+/** Barcode Code 128 (set B) yang bisa dibaca scanner barcode biasa. */
+const C128 = ('212222 222122 222221 121223 121322 131222 122213 122312 132212 221213 221312 231212 112232 122132 122231 113222 123122 123221 223211 221132 ' +
+  '221231 213212 223112 312131 311222 321122 321221 312212 322112 322211 212123 212321 232121 111323 131123 131321 112313 132113 132311 211313 ' +
+  '231113 231311 112133 112331 132131 113123 113321 133121 313121 211331 231131 213113 213311 213131 311123 311321 331121 312113 312311 332111 ' +
+  '314111 221411 431111 111224 111422 121124 121421 141122 141221 112214 112412 122114 122411 142112 142211 241211 221114 413111 241112 134111 ' +
+  '111242 121142 121241 114212 124112 124211 411212 421112 421211 212141 214121 412121 111143 111341 131141 114113 114311 411113 411311 113141 ' +
+  '114131 311141 411131 211412 211214 211232 2331112').split(' ');
+function code128Svg(value, h) {
+  value = String(value || '').replace(/[^\x20-\x7E]/g, '');
+  const codes = [104];
+  for (let i = 0; i < value.length; i++) { codes.push(value.charCodeAt(i) - 32); }
+  codes.push(codes.reduce((a, c, i) => a + c * (i || 1), 0) % 103, 106);
+  let x = 10, bars = '';
+  codes.forEach(c => { const w = C128[c]; for (let i = 0; i < w.length; i++) { const n = +w[i]; if (i % 2 === 0) { bars += '<rect x="' + x + '" y="0" width="' + n + '" height="' + h + '"/>'; } x += n; } });
+  return '<svg class="sr-barcode" viewBox="0 0 ' + (x + 10) + ' ' + h + '" preserveAspectRatio="none" role="img" aria-label="Barcode ' + esc(value) + '" fill="#000">' + bars + '</svg>';
+}
 function serviceBarcodeMarkup(value){
   value=String(value||'SERVICE');
-  let bits='101';
-  for(let i=0;i<value.length;i++){
-    const n=value.charCodeAt(i);
-    bits += (n.toString(2).padStart(8,'0'))+'0';
-  }
-  bits += '10101';
-  let x=0, bars='';
-  for(let i=0;i<bits.length;i++){
-    if(bits[i]==='1') bars += '<rect x="'+x+'" y="0" width="1" height="38" fill="#000"/>';
-    x++;
-  }
-  return '<svg class="sr-barcode" viewBox="0 0 '+x+' 38" preserveAspectRatio="none" role="img" aria-label="Barcode '+esc(value)+'">'+bars+'</svg><div class="sr-barcode-text">'+esc(value)+'</div>';
+  return code128Svg(value, 38)+'<div class="sr-barcode-text">'+esc(value)+'</div>';
 }
 function serviceReceiptMarkup(x,width){
   const s=ST();
@@ -3835,16 +3860,36 @@ function serviceReceiptMarkup(x,width){
     '</div>';
   return h;
 }
+/** Label service: ditempel/diikat ke barang titipan. */
+function serviceLabelMarkup(x,width){
+  const s=ST();
+  const row=(l,r)=>'<div class="r-row"><span>'+esc(l)+'</span><span>'+esc(r||'-')+'</span></div>';
+  const block=(l,v)=>'<div class="r-item"><div class="r-name">'+esc(l)+'</div><div class="pre">'+esc(v||'-')+'</div></div>';
+  return '<div class="receipt '+(width===58?'w58':'w80')+'">'+
+    (LOGO()?'<img class="r-logo" src="'+esc(LOGO())+'" alt="">':'<div class="r-center r-store">'+esc(s.store_name||'Hardware Technology')+'</div>')+
+    '<hr class="r-sep"><div class="r-center" style="font-weight:700">LABEL SERVICE</div><hr class="r-sep">'+
+    row('Pelanggan',x.customer_name)+row('Tanggal',dmyhm(x.date_in))+row('No. HP',x.phone)+
+    '<hr class="r-sep">'+row('Barang',x.item_name)+row('Warna',x.item_color)+row('Kelengkapan',x.completeness)+
+    block('Masalah',x.problem)+block('Catatan',x.note)+
+    '<hr class="r-sep">'+serviceBarcodeMarkup(x.service_no)+'</div>';
+}
+const SVC_WHAT = { both: 'Struk + label', struk: 'Struk saja', label: 'Label saja' };
+function svcWhat() { const w = store.get('hdt_svc_print'); return SVC_WHAT[w] ? w : 'both'; }
+function servicePartsMarkup(x, paper, what) {
+  const parts = what === 'label' ? [serviceLabelMarkup(x, paper)] : what === 'struk' ? [serviceReceiptMarkup(x, paper)] : [serviceReceiptMarkup(x, paper), serviceLabelMarkup(x, paper)];
+  return parts;
+}
 function openServicePreview(x){
-  let paper=S.paper===58?58:80;
-  const m=openModal({title:'Preview Struk Service',size:'xl',body:'<div class="service-preview"><div class="service-preview-paper" id="svcPreviewPaper"></div><div><div class="field"><span class="field-label">Ukuran kertas</span><div class="service-paper-options"><label class="service-paper-option"><input type="radio" name="svcPaper" value="58" '+(paper===58?'checked':'')+'> <span><b>58mm</b><small>Struk lebih kecil dan hemat kertas.</small></span></label><label class="service-paper-option"><input type="radio" name="svcPaper" value="80" '+(paper===80?'checked':'')+'> <span><b>80mm</b><small>Lebih lebar untuk detail service.</small></span></label></div></div><div class="service-note">ⓘ Preview ditampilkan terlebih dahulu, sama seperti struk kasir. Tombol 🖨 Printer untuk memakai printer Bluetooth.</div></div></div>',foot:'<button class="btn" data-close2>Tutup</button><button type="button" class="btn" data-act="prnSetup" title="Atur printer struk">🖨 Printer</button><button class="btn btn-primary" id="svcPrint">Cetak Struk</button>'});
+  let paper=S.paper===58?58:80, what=svcWhat();
+  const m=openModal({title:'Preview Struk & Label Service',size:'xl',body:'<div class="service-preview"><div class="service-preview-paper" id="svcPreviewPaper"></div><div><div class="field"><span class="field-label">Ukuran kertas</span><div class="service-paper-options"><label class="service-paper-option"><input type="radio" name="svcPaper" value="58" '+(paper===58?'checked':'')+'> <span><b>58mm</b><small>Struk lebih kecil dan hemat kertas.</small></span></label><label class="service-paper-option"><input type="radio" name="svcPaper" value="80" '+(paper===80?'checked':'')+'> <span><b>80mm</b><small>Lebih lebar untuk detail service.</small></span></label></div></div><div class="field"><span class="field-label">Yang dicetak</span><div class="service-paper-options">'+Object.keys(SVC_WHAT).map(k=>'<label class="service-paper-option"><input type="radio" name="svcWhat" value="'+k+'" '+(what===k?'checked':'')+'> <span><b>'+SVC_WHAT[k]+'</b><small>'+({both:'Struk untuk pelanggan, label ditempel di barang.',struk:'Hanya struk untuk pelanggan.',label:'Hanya label untuk ditempel di barang.'}[k])+'</small></span></label>').join('')+'</div></div><div class="service-note">ⓘ Label berisi data pelanggan, barang, dan barcode nomor service untuk ditempel di barang. Tombol 🖨 Printer untuk memakai printer Bluetooth.</div></div></div>',foot:'<button class="btn" data-close2>Tutup</button><button type="button" class="btn" data-act="prnSetup" title="Atur printer struk">🖨 Printer</button><button class="btn btn-primary" id="svcPrint">Cetak</button>'});
   m.$('[data-close2]').onclick = () => m.close();
-  const draw=()=>$('#svcPreviewPaper',m.el).innerHTML=serviceReceiptMarkup(x,paper);
+  const draw=()=>$('#svcPreviewPaper',m.el).innerHTML='<div style="display:grid;gap:14px;justify-items:center">'+servicePartsMarkup(x,paper,what).join('')+'</div>';
   $$('input[name="svcPaper"]',m.el).forEach(el=>el.addEventListener('change',()=>{paper=Number(el.value);draw();}));
-  $('#svcPrint',m.el).onclick=()=>printService(x,paper);
+  $$('input[name="svcWhat"]',m.el).forEach(el=>el.addEventListener('change',()=>{what=el.value;store.set('hdt_svc_print',what);draw();}));
+  $('#svcPrint',m.el).onclick=()=>printService(x,paper,what);
   draw();
 }
-function printService(x,paper){ return printThermal('service', x, paper); }
+function printService(x,paper,what){ return printThermal('service', { x: x, what: what || svcWhat() }, paper); }
 
 /* ---------- daftar layar ---------- */
 Object.assign(ACT,{serviceNew(){serviceForm();},serviceEdit(t){run(t,async()=>serviceForm(await api('serviceGet',{id:Number(t.dataset.id)})));},servicePrint(t){run(t,async()=>openServicePreview(await api('serviceGet',{id:Number(t.dataset.id)})));}});
