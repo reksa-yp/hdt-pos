@@ -54,6 +54,16 @@ jobs:
           mkdir -p _site
           cp -r hdtpos-pwa/. _site/
 
+      # Halaman verifikasi cap QR invoice dibuka di HP pelanggan (tanpa login, tanpa
+      # "Alamat server"), jadi alamat Edge Function ditanam ke index.html di sini.
+      - name: Tanam alamat server publik (verifikasi cap QR invoice)
+        env:
+          SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+        run: |
+          if [ -n "$SUPABASE_PROJECT_REF" ]; then
+            sed -i "s|__HDT_PUBLIC_API_URL__|https://${SUPABASE_PROJECT_REF}.supabase.co/functions/v1/api|" _site/index.html
+          fi
+
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

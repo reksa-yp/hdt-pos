@@ -567,6 +567,10 @@ function createBackend_(P) {
   function invoiceEligible(t) {
     return t.customer_id > 0 && (t.method === 'cash' || t.method === 'transfer') && t.status === 'completed';
   }
+  /* Kode pengaman cap QR invoice. Dibuat dari kunci rahasia server, jadi tidak bisa ditebak
+     dari nomor invoice. Perangkat offline (P.noVerify) tidak punya kunci itu -> tidak membuat kode. */
+  function verifyCode(t) { return P.noVerify ? '' : sign('verify:' + t.id + ':' + t.invoice_no).slice(0, 16); }
+  function quoteVerifyCode(x) { return P.noVerify ? '' : sign('verifyq:' + x.id + ':' + x.quote_no).slice(0, 16); }
 
   /* ---------- bentuk data keluar ---------- */
   function pubUser(u) { return { id: u.id, username: u.username, full_name: u.full_name, role: u.role }; }
@@ -752,7 +756,25 @@ function createBackend_(P) {
     if (!t.invoice_eligible) { fail('Invoice hanya untuk pelanggan terdaftar dengan pembayaran tunai atau transfer.'); }
     var c = db.all('Customers').filter(function (x) { return x.id === t.customer_id; })[0];
     if (c) { t.customer = c.name; t.customer_addr = c.address; }
+    t.verify_code = verifyCode(t);
     return t;
+  } };
+  /* Verifikasi cap QR invoice -- PUBLIK (tanpa login): dipanggil halaman yang terbuka saat
+     pelanggan scan QR di invoice. Hanya mengembalikan SATU invoice, dan hanya bila kode
+     pengamannya cocok; alamat pelanggan tidak ikut dikirim. */
+  A.invoiceVerify = { auth: false, run: function (p) {
+    var no = String(p.no || '').trim().slice(0, 40), code = String(p.code || '').trim().toLowerCase().slice(0, 40);
+    var t = (no && code && !P.noVerify) ? db.all('Transactions').filter(function (x) { return x.invoice_no === no && verifyCode(x) === code; })[0] : null;
+    if (!t) { fail('Invoice tidak ditemukan atau kode verifikasi tidak cocok.', 'NOTFOUND'); }
+    var s = loadSettings();
+    var c = t.customer_id > 0 ? db.all('Customers').filter(function (x) { return x.id === t.customer_id; })[0] : null;
+    return {
+      store_name: s.store_name, store_phone: s.store_phone,
+      invoice_no: t.invoice_no, date: t.date, customer: c ? c.name : t.customer_name, cashier: t.user_name,
+      method: t.method, status: t.status,
+      items: db.all('TxItems').filter(function (i) { return i.tx_id === t.id; }).map(function (i) { return { name: i.name, qty: i.qty, price: i.price, subtotal: i.subtotal }; }),
+      subtotal: t.subtotal, discount_amount: t.discount_amount, tax_rate: t.tax_rate, tax_amount: t.tax_amount, grand_total: t.grand_total
+    };
   } };
 
   /* ----- service / reparasi ----- */
@@ -792,7 +814,7 @@ function createBackend_(P) {
               subtotal: x.subtotal, discount_type: x.discount_type, discount_value: x.discount_value, discount_amount: x.discount_amount,
               tax_rate: x.tax_rate, tax_amount: x.tax_amount, grand_total: x.grand_total,
               user_id: x.user_id, user_name: x.user_name, created_at: x.created_at, updated_at: x.updated_at };
-    if (withItems) { o.items = quoteItems(x); o.note = x.note; } else { o.item_count = quoteItems(x).length; }
+    if (withItems) { o.items = quoteItems(x); o.note = x.note; o.verify_code = quoteVerifyCode(x); } else { o.item_count = quoteItems(x).length; }
     return o;
   }
   function findQuote(id, user) {
@@ -812,6 +834,22 @@ function createBackend_(P) {
     return { total: rows.length, today: fmtDate_(P.now()), rows: rows.slice(0, 300).map(function (x) { return pubQuote(x, false); }) };
   } };
   A.quoteGet = { roles: ['admin', 'kasir'], run: function (p) { return pubQuote(findQuote(p.id), true); } };
+  /* Verifikasi cap QR penawaran harga -- PUBLIK (tanpa login), sama seperti invoiceVerify.
+     Yang dikirim adalah isi penawaran yang tersimpan SAAT INI (bila pernah diubah setelah
+     dicetak, halaman verifikasi menampilkan versi terbaru); alamat & telepon pelanggan tidak ikut. */
+  A.quoteVerify = { auth: false, run: function (p) {
+    var no = String(p.no || '').trim().slice(0, 40), code = String(p.code || '').trim().toLowerCase().slice(0, 40);
+    var x = (no && code && !P.noVerify) ? db.all('Quotes').filter(function (a) { return a.quote_no === no && quoteVerifyCode(a) === code; })[0] : null;
+    if (!x) { fail('Penawaran tidak ditemukan atau kode verifikasi tidak cocok.', 'NOTFOUND'); }
+    var s = loadSettings();
+    return {
+      store_name: s.store_name, store_phone: s.store_phone,
+      quote_no: x.quote_no, date: x.date, valid_until: x.valid_until, expired: x.valid_until < fmtDate_(P.now()),
+      customer: x.customer_name, cashier: x.user_name, updated_at: x.updated_at,
+      items: quoteItems(x).map(function (i) { return { name: i.name, qty: i.qty, price: i.price, subtotal: i.subtotal }; }),
+      subtotal: x.subtotal, discount_amount: x.discount_amount, tax_rate: x.tax_rate, tax_amount: x.tax_amount, grand_total: x.grand_total
+    };
+  } };
 
   A.quoteSave = { roles: ['admin', 'kasir'], write: true, run: function (p, user) {
     var raw = p.items;
