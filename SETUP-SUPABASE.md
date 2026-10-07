@@ -142,3 +142,23 @@ yang sudah berjalan, jalankan ulang `supabase/schema.sql` di SQL Editor
 satu kali — aman, semua perintahnya `if not exists` / `on conflict do nothing`,
 data lama tidak tersentuh. Sebelum itu dijalankan, fitur lain tetap normal;
 hanya menyimpan penawaran yang ditolak dengan pesan yang jelas.
+
+## Cap digital QR pada invoice & penawaran harga
+
+Invoice A4 dan penawaran harga memuat cap QR di antara "Hormat kami," dan nama
+penanda tangan. Saat di-scan, QR membuka halaman verifikasi publik (tanpa login)
+di alamat aplikasi, misalnya `https://<user>.github.io/hdt-pos/?v=26-200-000123.<kode>`
+(invoice) atau `?q=PNW-261007-001.<kode>` (penawaran).
+
+- **Kode pengaman** dibuat server dari `HMAC_SECRET`. Pastikan `HMAC_SECRET` sudah
+  di-set di Supabase (`supabase secrets set HMAC_SECRET=...`) dengan nilai acak yang
+  panjang. Kalau tidak di-set, server memakai nilai bawaan yang tertulis di kode
+  sumber, sehingga kode pengaman bisa dipalsukan. Mengganti `HMAC_SECRET` membuat
+  semua cap QR yang sudah dicetak tidak lagi terverifikasi (dan semua user harus
+  login ulang).
+- **Alamat server** untuk halaman verifikasi ditanam ke `index.html` saat deploy
+  (lihat langkah "Tanam alamat server publik" di `.github/workflows/deploy.yml`),
+  memakai secret `SUPABASE_PROJECT_REF`. Kalau di-hosting dengan cara lain, ganti
+  `__HDT_PUBLIC_API_URL__` di `hdtpos-pwa/index.html` dengan URL Edge Function.
+- Cap hanya muncul untuk dokumen yang sudah tersinkron ke server. Dokumen yang
+  dibuat saat offline dicetak tanpa cap sampai perangkat online kembali.
